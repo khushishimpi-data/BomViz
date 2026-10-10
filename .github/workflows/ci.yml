@@ -81,17 +81,19 @@ jobs:
           cp backend/.env.example backend/.env
           cp frontend/.env.example frontend/.env
           sed -i "s/^JWT_SECRET_KEY=.*/JWT_SECRET_KEY=$(openssl rand -hex 32)/" backend/.env
-      - name: Start stack
-        run: docker compose up --build --detach --wait --wait-timeout 300
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+      # Install before starting the stack: the frontend service's /app/node_modules volume
+      # makes Docker create frontend/node_modules on the host as root, which npm cannot write.
       - run: npm ci
         working-directory: frontend
       - run: npx playwright install --with-deps chromium
         working-directory: frontend
+      - name: Start stack
+        run: docker compose up --build --detach --wait --wait-timeout 300
       - run: npm run test:e2e
         working-directory: frontend
       - name: Stack logs
