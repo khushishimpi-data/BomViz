@@ -1,0 +1,115 @@
+# Local development stack. Copy .env.example -> .env, backend/.env.example -> backend/.env and
+# frontend/.env.example -> frontend/.env, then run: docker compose up --build
+name: bomviz
+
+x-backend-common: &backend-common
+  build: { context: ./backend }
+  env_file: ./backend/.env
+  volumes:
+    - ./backend:/app
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    minio-init: { condition: service_completed_successfully }
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-bomviz}
+      POSTGRES_USER: ${POSTGRES_USER:-bomviz}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    ports: ["${POSTGRES_HOST_PORT:-5432}:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["${REDIS_HOST_PORT:-6379}:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  minio:
+    # Official minio/minio images are no longer published; pgsty/minio is a maintained
+    # community build of the same server (drop-in, same CLI and S3 API).
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    ports:
+      - "${MINIO_API_HOST_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_HOST_PORT:-9001}:9001"
+    volumes: [miniodata:/data]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: create the private bucket.
+  minio-init:
+    image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z
+    depends_on:
+      minio: { condition: service_healthy }
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET:-bomviz}
+    entrypoint: >
+      /bin/sh -c "mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+                  mc mb --ignore-existing local/$$S3_BUCKET &&
+                  mc anonymous set none local/$$S3_BUCKET"
+    restart: "no"
+
+  # One-shot: apply database migrations before the API and worker start.
+  migrate:
+    <<: *backend-common
+    command: alembic upgrade head
+    restart: "no"
+
+  backend:
+    <<: *backend-common
+    command: uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000 --reload
+    ports: ["${BACKEND_HOST_PORT:-8000}:8000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  worker:
+    <<: *backend-common
+    command: celery -A app.workers.celery_app:celery_app worker --loglevel=INFO --concurrency=2
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app:celery_app inspect ping -d celery@$$HOSTNAME --timeout 5"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 20s
+
+  frontend:
+    build: { context: ./frontend }
+    env_file: ./frontend/.env
+    ports: ["${FRONTEND_HOST_PORT:-5173}:5173"]
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      backend: { condition: service_healthy }
+
+volumes:
+  pgdata:
+  miniodata:
