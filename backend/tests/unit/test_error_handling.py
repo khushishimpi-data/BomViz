@@ -18,6 +18,12 @@ def app_with_routes(app: FastAPI) -> FastAPI:
             details=[{"row_number": 4}],
         )
 
+    @app.get("/test/app-error-with-headers")
+    async def raise_app_error_with_headers() -> None:
+        raise AppError(
+            "Slow down.", code="RATE_LIMITED", status_code=429, headers={"Retry-After": "42"}
+        )
+
     @app.get("/test/crash")
     async def crash() -> None:
         raise RuntimeError("password=hunter2 at /srv/app/secret.py line 12")
@@ -40,6 +46,16 @@ async def test_app_error_rendered_as_envelope(
     assert error["message"] == "BOM contains blocking validation errors."
     assert error["details"] == [{"row_number": 4}]
     assert error["request_id"] == response.headers["X-Request-ID"]
+
+
+async def test_app_error_headers_are_sent_with_the_envelope(
+    app_with_routes: FastAPI, client: AsyncClient
+) -> None:
+    response = await client.get("/test/app-error-with-headers")
+
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "42"
+    assert response.json()["error"]["code"] == "RATE_LIMITED"
 
 
 async def test_unknown_route_returns_not_found_envelope(client: AsyncClient) -> None:

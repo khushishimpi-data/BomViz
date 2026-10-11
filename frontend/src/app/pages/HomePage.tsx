@@ -1,9 +1,17 @@
 import { ChevronRight } from 'lucide-react';
 import { Fragment } from 'react';
+import { Navigate } from 'react-router';
+
+import { homePathFor } from '@/features/auth/last-workspace';
+import { useAuth } from '@/features/auth/useAuth';
 
 const WORKFLOW_STEPS = ['Upload', 'Map', 'Validate', 'Preview', 'Import', 'View'] as const;
 
+/** Public landing page; signed-in users go straight to their workspace. */
 export function HomePage() {
+  const { status, memberships } = useAuth();
+  if (status === 'authenticated') return <Navigate to={homePathFor(memberships)} replace />;
+
   return (
     <section aria-labelledby="home-title" className="space-y-6">
       <div className="space-y-2">

@@ -44,6 +44,7 @@ class AppError(Exception):
         code: str | None = None,
         status_code: int | None = None,
         details: list[dict[str, Any]] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -52,14 +53,21 @@ class AppError(Exception):
         if status_code is not None:
             self.status_code = status_code
         self.details = details or []
+        # Extra response headers such as `Retry-After`; never put secrets here.
+        self.headers = headers or {}
 
 
 def error_response(
-    status_code: int, code: str, message: str, details: list[dict[str, Any]] | None = None
+    status_code: int,
+    code: str,
+    message: str,
+    details: list[dict[str, Any]] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     """Build a JSON response in the standard error envelope."""
     return JSONResponse(
         status_code=status_code,
+        headers=headers,
         content={
             "error": {
                 "code": code,
@@ -73,7 +81,7 @@ def error_response(
 
 async def _handle_app_error(_: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, AppError)  # noqa: S101 - narrowing for the type checker
-    return error_response(exc.status_code, exc.code, exc.message, exc.details)
+    return error_response(exc.status_code, exc.code, exc.message, exc.details, exc.headers)
 
 
 async def _handle_http_exception(_: Request, exc: Exception) -> JSONResponse:

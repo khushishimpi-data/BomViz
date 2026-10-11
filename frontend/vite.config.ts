@@ -8,7 +8,8 @@ import { defineConfig, loadEnv } from 'vite';
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   // The dev server proxies API calls so the browser stays same-origin (required for the
-  // SameSite=Strict refresh-token cookie).
+  // SameSite=Strict refresh-token cookie). `xfwd` appends the browser's address to
+  // X-Forwarded-For; the backend trusts it only from this container (TRUSTED_PROXY_IPS).
   const proxyTarget = env.VITE_API_PROXY_TARGET || 'http://localhost:8000';
 
   return {
@@ -20,8 +21,8 @@ export default defineConfig(({ mode }) => {
       port: 5173,
       strictPort: true,
       proxy: {
-        '/api': { target: proxyTarget, changeOrigin: true },
-        '/health': { target: proxyTarget, changeOrigin: true },
+        '/api': { target: proxyTarget, changeOrigin: true, xfwd: true },
+        '/health': { target: proxyTarget, changeOrigin: true, xfwd: true },
       },
     },
     test: {

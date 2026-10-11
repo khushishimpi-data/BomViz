@@ -11,12 +11,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from redis.asyncio import Redis
 
 from app import __version__
-from app.api import health
+from app.api import auth, health, products, workspaces
 from app.core.config import Settings, get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging
 from app.core.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
-from app.db.session import build_engine
+from app.db.session import build_engine, build_sessionmaker
 from app.services.storage_service import ObjectStorage
 
 
@@ -27,6 +27,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = build_engine(settings)
     redis: Redis = Redis.from_url(settings.redis_url, socket_connect_timeout=2)
     app.state.engine = engine
+    app.state.sessionmaker = build_sessionmaker(engine)
     app.state.redis = redis
     app.state.storage = ObjectStorage(settings)
     try:
@@ -63,4 +64,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_exception_handlers(app)
 
     app.include_router(health.router)
+    app.include_router(auth.router, prefix=settings.api_v1_prefix)
+    app.include_router(workspaces.router, prefix=settings.api_v1_prefix)
+    app.include_router(products.router, prefix=settings.api_v1_prefix)
     return app

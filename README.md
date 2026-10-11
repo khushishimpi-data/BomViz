@@ -5,9 +5,11 @@ to standard fields, validate every row, and import the result into PostgreSQL wi
 source traceability. Then explore each BOM in four ways: an indented tree, a flattened
 purchasing roll-up, a where-used graph, or a two-panel revision diff.
 
-> **Status: Phase 0 (foundation) complete.** The stack, configuration, logging, health checks,
-> migrations baseline, application shells and CI are in place. Product features arrive in
-> Phases 1–7 (see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#delivery-phases)).
+> **Status: Phase 1 (auth, workspaces, products) complete.** On top of the Phase 0 foundation
+> (stack, configuration, logging, health checks, migrations, CI), you can register and sign in,
+> create workspaces, manage members with per-workspace roles, and create products and
+> revisions. BOM upload and the remaining features arrive in Phases 2–7 (see
+> [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#delivery-phases)).
 
 ## Stack
 
@@ -45,6 +47,23 @@ matching `*_HOST_PORT` values in `.env`.
 4. `backend`, `worker` and `frontend` start.
 
 Each long-running service has a health check.
+
+After rerunning migrations against a running stack (for example
+`docker compose run --rm migrate sh -c "alembic downgrade base && alembic upgrade head"`), run
+`docker compose restart backend worker`. Recreated types such as `citext` get new database ids,
+and pooled connections would otherwise keep the old ones and fail.
+
+### First account
+
+There are no seeded users. Anyone can register.
+
+1. Open <http://localhost:5173/register> and create an account. The password must be 12–128
+   characters and must not be your email (in any letter case).
+2. Sign in, then create a workspace. You become its owner and `ADMIN`.
+3. To add teammates, have them register first. Then add them by email on the workspace's
+   Members page and pick a role. There are no invitation emails.
+
+Roles and what each can do are listed in [docs/API.md](docs/API.md#roles-and-permissions).
 
 ## Local development without Docker
 
@@ -109,7 +128,12 @@ Docker Compose stack.
 | `CELERY_TASK_ALWAYS_EAGER` | `false` | Run tasks inline (tests only) |
 | `JWT_SECRET_KEY` | none | **Required in production**: at least 32 random characters |
 | `JWT_ALGORITHM`, `ACCESS_TOKEN_TTL_MINUTES`, `REFRESH_TOKEN_TTL_DAYS` | `HS256`, `15`, `7` | Token settings |
+| `JWT_ISSUER`, `JWT_AUDIENCE` | `bomviz`, `bomviz-api` | Access token `iss` / `aud` claims |
+| `REFRESH_COOKIE_NAME`, `REFRESH_COOKIE_PATH` | `bomviz_refresh`, `/api/v1/auth` | Refresh cookie name and path |
 | `REFRESH_COOKIE_SECURE` | `false` | Must be `true` in production |
+| `LOGIN_FREE_ATTEMPTS`, `LOGIN_BASE_DELAY_SECONDS`, `LOGIN_MAX_DELAY_SECONDS`, `LOGIN_THROTTLE_RESET_HOURS` | `4`, `30`, `900`, `24` | Progressive login throttle per (email, IP); see [docs/API.md](docs/API.md) |
+| `RATE_LIMIT_ENABLED` | `true` | Rate limits on register, login and refresh (per IP) and on adding members (per user) |
+| `TRUSTED_PROXY_IPS` | empty | Comma-separated IPs/CIDRs of reverse proxies whose `X-Forwarded-For` is believed. Empty trusts nobody, so the client IP is the direct peer. An invalid entry stops startup. Docker Compose sets it to the frontend container (`172.30.0.10`). Behind any other proxy or load balancer, set it to that proxy's address, or all clients share one identity for rate limits and the login throttle. See [docs/API.md](docs/API.md). |
 | `S3_ENDPOINT_URL` | none | Storage endpoint the backend uses. Leave empty for AWS S3. |
 | `S3_PUBLIC_ENDPOINT_URL` | none | Host used in signed URLs given to browsers |
 | `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_BUCKET`, `S3_REGION` | none | Storage credentials. These never reach the frontend. |

@@ -5,6 +5,11 @@ name: bomviz
 x-backend-common: &backend-common
   build: { context: ./backend }
   env_file: ./backend/.env
+  environment:
+    # Only the Vite dev proxy (frontend, fixed address below) may set X-Forwarded-For. Direct
+    # host requests to :8000 arrive from the network gateway, so they cannot spoof it.
+    TRUSTED_PROXY_IPS: 172.30.0.10
+  networks: [bomviz]
   volumes:
     - ./backend:/app
   depends_on:
@@ -15,6 +20,7 @@ x-backend-common: &backend-common
 services:
   postgres:
     image: postgres:16-alpine
+    networks: [bomviz]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-bomviz}
       POSTGRES_USER: ${POSTGRES_USER:-bomviz}
@@ -29,6 +35,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    networks: [bomviz]
     ports: ["${REDIS_HOST_PORT:-6379}:6379"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -40,6 +47,7 @@ services:
     # Official minio/minio images are no longer published; pgsty/minio is a maintained
     # community build of the same server (drop-in, same CLI and S3 API).
     image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    networks: [bomviz]
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
@@ -57,6 +65,7 @@ services:
   # One-shot: create the private bucket.
   minio-init:
     image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z
+    networks: [bomviz]
     depends_on:
       minio: { condition: service_healthy }
     environment:
@@ -103,12 +112,24 @@ services:
   frontend:
     build: { context: ./frontend }
     env_file: ./frontend/.env
+    networks:
+      bomviz:
+        # Fixed so the backend can trust exactly this proxy (TRUSTED_PROXY_IPS above).
+        ipv4_address: 172.30.0.10
     ports: ["${FRONTEND_HOST_PORT:-5173}:5173"]
     volumes:
       - ./frontend:/app
       - /app/node_modules
     depends_on:
       backend: { condition: service_healthy }
+
+networks:
+  bomviz:
+    ipam:
+      # A /24 inside Docker's 172.16/12 pool but far from its usual 172.17-172.2x defaults.
+      # If it clashes with a local network, change it here and both 172.30.0.10 values above.
+      config:
+        - subnet: 172.30.0.0/24
 
 volumes:
   pgdata:

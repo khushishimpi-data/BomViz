@@ -1,10 +1,13 @@
 """Application settings loaded from environment variables (and `.env` in local development)."""
 
+import ipaddress
 from functools import lru_cache
 from typing import Literal, Self
 
-from pydantic import SecretStr, model_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.core.client_ip import IPNetwork
 
 MIN_PRODUCTION_SECRET_LENGTH = 32
 _PLACEHOLDER_SECRETS = frozenset({"", "change-me", "changeme", "secret"})
@@ -33,9 +36,22 @@ class Settings(BaseSettings):
 
     jwt_secret_key: SecretStr = SecretStr("")
     jwt_algorithm: str = "HS256"
+    jwt_issuer: str = "bomviz"
+    jwt_audience: str = "bomviz-api"
     access_token_ttl_minutes: int = 15
     refresh_token_ttl_days: int = 7
+    refresh_cookie_name: str = "bomviz_refresh"
+    refresh_cookie_path: str = "/api/v1/auth"
     refresh_cookie_secure: bool = False
+
+    login_free_attempts: int = 4
+    login_base_delay_seconds: int = 30
+    login_max_delay_seconds: int = 900
+    login_throttle_reset_hours: int = 24
+    rate_limit_enabled: bool = True
+    # Comma-separated IPs/CIDRs of reverse proxies whose X-Forwarded-For header is believed.
+    # Empty (the default) trusts nobody: the client IP is always the direct peer address.
+    trusted_proxy_ips: str = ""
 
     s3_endpoint_url: str | None = None
     s3_public_endpoint_url: str | None = None
@@ -51,6 +67,17 @@ class Settings(BaseSettings):
     def cors_origin_list(self) -> list[str]:
         """CORS origins parsed from the comma-separated `CORS_ORIGINS` value."""
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def trusted_proxy_networks(self) -> list[IPNetwork]:
+        """`TRUSTED_PROXY_IPS` parsed into networks (a bare IP becomes a /32 or /128)."""
+        return _parse_networks(self.trusted_proxy_ips)
+
+    @field_validator("trusted_proxy_ips")
+    @classmethod
+    def _validate_trusted_proxy_ips(cls, value: str) -> str:
+        _parse_networks(value)
+        return value
 
     @property
     def is_production(self) -> bool:
@@ -69,6 +96,21 @@ class Settings(BaseSettings):
         if self.refresh_cookie_secure is False:
             raise ValueError("REFRESH_COOKIE_SECURE must be true in production")
         return self
+
+
+def _parse_networks(value: str) -> list[IPNetwork]:
+    networks: list[IPNetwork] = []
+    for entry in (part.strip() for part in value.split(",")):
+        if not entry:
+            continue
+        try:
+            # strict: a CIDR with host bits set (e.g. 10.0.0.5/24) is a likely typo, not a range.
+            networks.append(ipaddress.ip_network(entry, strict=True))
+        except ValueError as exc:
+            raise ValueError(
+                f"TRUSTED_PROXY_IPS entry {entry!r} is not an IP address or CIDR"
+            ) from exc
+    return networks
 
 
 @lru_cache

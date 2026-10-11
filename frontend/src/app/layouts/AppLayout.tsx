@@ -1,9 +1,14 @@
 import { Boxes } from 'lucide-react';
 import { Link, Outlet } from 'react-router';
 
+import { Button } from '@/components/ui/button';
+import { useAuth } from '@/features/auth/useAuth';
+import { UserMenu } from '@/features/auth/UserMenu';
 import { SystemStatus } from '@/features/system-status/SystemStatus';
+import { WorkspaceSwitcher } from '@/features/workspaces/WorkspaceSwitcher';
 
 export function AppLayout() {
+  const { status } = useAuth();
   return (
     <div className="flex min-h-screen flex-col">
       <a
@@ -18,7 +23,21 @@ export function AppLayout() {
             <Boxes className="size-5 text-primary" aria-hidden />
             BOMViz
           </Link>
-          <SystemStatus />
+          <div className="flex items-center gap-4">
+            <SystemStatus />
+            <WorkspaceSwitcher />
+            {status === 'authenticated' && <UserMenu />}
+            {status === 'anonymous' && (
+              <nav aria-label="Account" className="flex items-center gap-2">
+                <Button asChild variant="ghost" size="sm">
+                  <Link to="/login">Sign in</Link>
+                </Button>
+                <Button asChild size="sm">
+                  <Link to="/register">Create account</Link>
+                </Button>
+              </nav>
+            )}
+          </div>
         </div>
       </header>
       <main id="main" className="mx-auto w-full max-w-7xl flex-1 px-4 py-8">

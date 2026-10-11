@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "BOMViz API: manufacturing Bill of Materials ingestion, validation and analysis."
 requires-python = ">=3.12"
 dependencies = [
-    "fastapi>=0.115",
+    "fastapi>=0.121",
     "uvicorn[standard]>=0.32",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
@@ -14,6 +14,9 @@ dependencies = [
     "celery[redis]>=5.4",
     "redis>=5.2",
     "boto3>=1.35",
+    "pyjwt>=2.9",
+    "argon2-cffi>=23.1",
+    "email-validator>=2.2",
 ]
 
 [dependency-groups]
