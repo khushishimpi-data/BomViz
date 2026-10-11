@@ -61,6 +61,19 @@ class Settings(BaseSettings):
     s3_region: str = "us-east-1"
     signed_url_ttl_seconds: int = 300
 
+    # BOM upload and parsing limits (Phase 2).
+    max_upload_bytes: int = 20 * 1024 * 1024
+    parse_max_rows: int = 50_000
+    parse_max_columns: int = 200
+    parse_max_cell_chars: int = 32_767
+    parse_sample_rows: int = 100
+    parse_max_uncompressed_bytes: int = 200 * 1024 * 1024
+    job_stale_after_minutes: int = 15
+    # Celery limits on one `boms.parse` run: the soft limit fails the job with
+    # `PARSE_FILE_TOO_COMPLEX`; the hard limit kills the worker process.
+    parse_soft_time_limit_seconds: int = 600
+    parse_hard_time_limit_seconds: int = 660
+
     readiness_timeout_seconds: float = 2.0
 
     @property
@@ -82,6 +95,23 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
+
+    @model_validator(mode="after")
+    def _check_parse_time_limits(self) -> Self:
+        # A running job is only treated as stale (and replaceable) after the soft limit has had
+        # the chance to fail it, and the hard limit must leave time to record that failure.
+        soft = self.parse_soft_time_limit_seconds
+        if soft <= 0:
+            raise ValueError("PARSE_SOFT_TIME_LIMIT_SECONDS must be positive")
+        if self.parse_hard_time_limit_seconds <= soft:
+            raise ValueError(
+                "PARSE_HARD_TIME_LIMIT_SECONDS must be greater than PARSE_SOFT_TIME_LIMIT_SECONDS"
+            )
+        if soft >= self.job_stale_after_minutes * 60:
+            raise ValueError(
+                "PARSE_SOFT_TIME_LIMIT_SECONDS must be less than JOB_STALE_AFTER_MINUTES * 60"
+            )
+        return self
 
     @model_validator(mode="after")
     def _require_strong_secret_in_production(self) -> Self:

@@ -7,6 +7,7 @@ from typing import Annotated
 
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security.utils import get_authorization_scheme_param
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -20,6 +21,7 @@ from app.repositories.workspace_repository import WorkspaceAccess, WorkspaceRepo
 from app.services.auth_service import AuthService
 from app.services.health_service import HealthService
 from app.services.rate_limiter import RateLimiter
+from app.services.storage_service import Storage
 from app.services.workspace_service import (
     ForbiddenError,
     WorkspaceNotFoundError,
@@ -67,6 +69,15 @@ def get_health_service(request: Request) -> HealthService:
 
 
 HealthServiceDep = Annotated[HealthService, Depends(get_health_service)]
+
+
+def get_storage(request: Request) -> Storage:
+    """The application's object storage (tests override this with `FakeStorage`)."""
+    storage: Storage = request.app.state.storage
+    return storage
+
+
+StorageDep = Annotated[Storage, Depends(get_storage)]
 
 
 async def get_db_session(request: Request) -> AsyncIterator[AsyncSession]:
@@ -137,6 +148,16 @@ class UnauthenticatedError(AppError):
 _bearer_scheme = HTTPBearer(auto_error=False)
 
 
+async def _authenticate_token(auth_service: AuthService, token: str) -> User:
+    """`AuthService.authenticate_access_token`, with the Bearer challenge added to its 401s."""
+    try:
+        return await auth_service.authenticate_access_token(token)
+    except AppError as exc:
+        if exc.status_code == HTTPStatus.UNAUTHORIZED:
+            exc.headers = {**exc.headers, **WWW_AUTHENTICATE_BEARER}
+        raise
+
+
 async def get_current_user(
     auth_service: AuthServiceDep,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer_scheme)],
@@ -149,12 +170,23 @@ async def get_current_user(
     """
     if credentials is None:
         raise UnauthenticatedError()
-    try:
-        return await auth_service.authenticate_access_token(credentials.credentials)
-    except AppError as exc:
-        if exc.status_code == HTTPStatus.UNAUTHORIZED:
-            exc.headers = {**exc.headers, **WWW_AUTHENTICATE_BEARER}
-        raise
+    return await _authenticate_token(auth_service, credentials.credentials)
+
+
+async def authenticate_request(request: Request) -> User:
+    """The same checks as `CurrentUserDep`, for code that runs before dependency resolution.
+
+    Used where the caller must be known before the request body is read (the upload route
+    class). Parses the `Authorization` header as `HTTPBearer` does and verifies the token on a
+    short-lived session of its own, closed before returning; raises the same 401s.
+    """
+    scheme, token = get_authorization_scheme_param(request.headers.get("authorization"))
+    if not token or scheme.lower() != "bearer":
+        raise UnauthenticatedError()
+    sessionmaker: async_sessionmaker[AsyncSession] = request.app.state.sessionmaker
+    settings: Settings = request.app.state.settings
+    async with sessionmaker() as session:
+        return await _authenticate_token(AuthService(session, settings), token)
 
 
 CurrentUserDep = Annotated[User, Depends(get_current_user)]
@@ -180,14 +212,25 @@ def require_workspace_permission(
     async def resolve_workspace_access(
         workspace_id: uuid.UUID, current_user: CurrentUserDep, session: DbSessionDep
     ) -> WorkspaceAccess:
-        access = await WorkspaceRepository(session).get_access(workspace_id, current_user.id)
-        if access is None:
-            raise WorkspaceNotFoundError()
-        if not has_permission(access.membership.role, permission):
-            raise ForbiddenError()
-        return access
+        return await check_workspace_permission(session, workspace_id, current_user, permission)
 
     return resolve_workspace_access
+
+
+async def check_workspace_permission(
+    session: AsyncSession, workspace_id: uuid.UUID, user: User, permission: Permission
+) -> WorkspaceAccess:
+    """Resolve `workspace_id` for `user` and require `permission` (404 / 403 as above).
+
+    For routes that receive the workspace id outside the path or query string, such as a
+    multipart form field, and so cannot use `require_workspace_permission`.
+    """
+    access = await WorkspaceRepository(session).get_access(workspace_id, user.id)
+    if access is None:
+        raise WorkspaceNotFoundError()
+    if not has_permission(access.membership.role, permission):
+        raise ForbiddenError()
+    return access
 
 
 WorkspaceReadDep = Annotated[

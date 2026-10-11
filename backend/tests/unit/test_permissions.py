@@ -9,13 +9,15 @@ R = Permission.WORKSPACE_READ
 M = Permission.WORKSPACE_MANAGE_MEMBERS
 PR = Permission.PRODUCT_READ
 PW = Permission.PRODUCT_WRITE
+BR = Permission.BOM_READ
+BU = Permission.BOM_UPLOAD
 
 EXPECTED_GRANTS: dict[UserRole, set[Permission]] = {
-    UserRole.ADMIN: {R, M, PR, PW},
-    UserRole.ENGINEER: {R, PR, PW},
-    UserRole.PROCUREMENT: {R, PR},
-    UserRole.PRODUCTION: {R, PR},
-    UserRole.VIEWER: {R, PR},
+    UserRole.ADMIN: {R, M, PR, PW, BR, BU},
+    UserRole.ENGINEER: {R, PR, PW, BR, BU},
+    UserRole.PROCUREMENT: {R, PR, BR},
+    UserRole.PRODUCTION: {R, PR, BR},
+    UserRole.VIEWER: {R, PR, BR},
 }
 
 MATRIX = [
@@ -44,6 +46,8 @@ def test_permission_values_are_stable() -> None:
         "workspace:manage_members",
         "product:read",
         "product:write",
+        "bom:read",
+        "bom:upload",
     }
 
 

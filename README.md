@@ -5,10 +5,11 @@ to standard fields, validate every row, and import the result into PostgreSQL wi
 source traceability. Then explore each BOM in four ways: an indented tree, a flattened
 purchasing roll-up, a where-used graph, or a two-panel revision diff.
 
-> **Status: Phase 1 (auth, workspaces, products) complete.** On top of the Phase 0 foundation
-> (stack, configuration, logging, health checks, migrations, CI), you can register and sign in,
-> create workspaces, manage members with per-workspace roles, and create products and
-> revisions. BOM upload and the remaining features arrive in Phases 2–7 (see
+> **Status: Phase 2 (upload and parsing) complete.** On top of the Phase 0 foundation (stack,
+> configuration, logging, health checks, migrations, CI) and Phase 1 (sign-in, workspaces,
+> members with per-workspace roles, products and revisions), you can upload a CSV or Excel BOM,
+> download the immutable original, and see a raw preview with a suggested column mapping.
+> Saving the mapping, validation, import and the remaining features arrive in Phases 3–7 (see
 > [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#delivery-phases)).
 
 ## Stack
@@ -48,6 +49,10 @@ matching `*_HOST_PORT` values in `.env`.
 
 Each long-running service has a health check.
 
+The Celery worker does not reload code changes (only the backend runs with `--reload`).
+After changing backend code that the worker runs, such as parsing or jobs, run
+`docker compose restart worker`.
+
 After rerunning migrations against a running stack (for example
 `docker compose run --rm migrate sh -c "alembic downgrade base && alembic upgrade head"`), run
 `docker compose restart backend worker`. Recreated types such as `citext` get new database ids,
@@ -64,6 +69,23 @@ There are no seeded users. Anyone can register.
    Members page and pick a role. There are no invitation emails.
 
 Roles and what each can do are listed in [docs/API.md](docs/API.md#roles-and-permissions).
+
+### Try an upload
+
+1. Open a workspace and choose **BOMs**. The page offers CSV and XLSX templates whose headers
+   are the standard BOM fields, required ones first.
+2. Choose **Upload BOM** (`ADMIN` and `ENGINEER` only). Pick a `.csv`, `.xlsx` or `.xls` file of
+   at most 20 MB, give the BOM a name, and optionally a revision label, product and product
+   revision.
+3. The detail page opens and shows the parse job until it finishes, usually within seconds.
+   Then the raw preview shows the first 100 rows, with the suggested standard field and its
+   confidence above each column, and a warning if a required field (part number, part name,
+   quantity) was not matched.
+4. If the sheet, header row, delimiter or encoding was detected wrongly, re-parse with explicit
+   options. **Download original** returns the exact uploaded bytes.
+
+Uploading the same file twice to one workspace is refused with a link to the existing BOM.
+Limits and error codes are in [docs/API.md](docs/API.md#bom-upload-and-parsing-phase-2-).
 
 ## Local development without Docker
 
@@ -132,12 +154,19 @@ Docker Compose stack.
 | `REFRESH_COOKIE_NAME`, `REFRESH_COOKIE_PATH` | `bomviz_refresh`, `/api/v1/auth` | Refresh cookie name and path |
 | `REFRESH_COOKIE_SECURE` | `false` | Must be `true` in production |
 | `LOGIN_FREE_ATTEMPTS`, `LOGIN_BASE_DELAY_SECONDS`, `LOGIN_MAX_DELAY_SECONDS`, `LOGIN_THROTTLE_RESET_HOURS` | `4`, `30`, `900`, `24` | Progressive login throttle per (email, IP); see [docs/API.md](docs/API.md) |
-| `RATE_LIMIT_ENABLED` | `true` | Rate limits on register, login and refresh (per IP) and on adding members (per user) |
+| `RATE_LIMIT_ENABLED` | `true` | Rate limits on register, login and refresh (per IP) and on adding members and uploading BOMs (per user) |
 | `TRUSTED_PROXY_IPS` | empty | Comma-separated IPs/CIDRs of reverse proxies whose `X-Forwarded-For` is believed. Empty trusts nobody, so the client IP is the direct peer. An invalid entry stops startup. Docker Compose sets it to the frontend container (`172.30.0.10`). Behind any other proxy or load balancer, set it to that proxy's address, or all clients share one identity for rate limits and the login throttle. See [docs/API.md](docs/API.md). |
 | `S3_ENDPOINT_URL` | none | Storage endpoint the backend uses. Leave empty for AWS S3. |
 | `S3_PUBLIC_ENDPOINT_URL` | none | Host used in signed URLs given to browsers |
 | `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_BUCKET`, `S3_REGION` | none | Storage credentials. These never reach the frontend. |
 | `SIGNED_URL_TTL_SECONDS` | `300` | Lifetime of download links |
+| `MAX_UPLOAD_BYTES` | `20971520` (20 MB) | Largest accepted BOM file; larger uploads get `413 FILE_TOO_LARGE` |
+| `PARSE_MAX_ROWS`, `PARSE_MAX_COLUMNS`, `PARSE_MAX_CELL_CHARS` | `50000`, `200`, `32767` | Parser limits; exceeding one fails the parse job with a `PARSE_*` code |
+| `PARSE_SAMPLE_ROWS` | `100` | Data rows kept in the stored preview snapshot |
+| `PARSE_MAX_UNCOMPRESSED_BYTES` | `209715200` (200 MB) | Zip-bomb guard: total uncompressed size allowed for an `.xlsx` |
+| `JOB_STALE_AFTER_MINUTES` | `15` | A queued or running parse job older than this no longer blocks a re-parse |
+| `PARSE_SOFT_TIME_LIMIT_SECONDS` | `600` | A parse run longer than this fails with `PARSE_FILE_TOO_COMPLEX` ("The file took too long to parse."). Must be positive and less than `JOB_STALE_AFTER_MINUTES` × 60, or startup fails. |
+| `PARSE_HARD_TIME_LIMIT_SECONDS` | `660` | The worker process running a parse is killed after this; the job then stays `RUNNING` until it is resumed or goes stale. Must be greater than the soft limit, or startup fails. |
 | `READINESS_TIMEOUT_SECONDS` | `2` | Timeout for each readiness check |
 
 ### `frontend/.env`

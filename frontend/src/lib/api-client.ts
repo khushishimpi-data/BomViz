@@ -32,45 +32,63 @@ export interface ApiRequestOptions {
 /** Auth failures that a fresh access token can fix; anything else is surfaced as-is. */
 const REFRESHABLE_CODES: ReadonlySet<string> = new Set(['TOKEN_EXPIRED', 'TOKEN_INVALID']);
 
-async function send(
-  method: HttpMethod,
-  path: string,
-  options: ApiRequestOptions,
-  token: string | null,
-): Promise<Response> {
-  const headers = new Headers({ Accept: 'application/json' });
-  if (options.body !== undefined) headers.set('Content-Type', 'application/json');
+/** What a request carries: nothing, a JSON value, or multipart form data. */
+type RequestPayload =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'json'; readonly value: unknown }
+  | { readonly kind: 'form'; readonly value: FormData };
+
+interface AuthorizedRequest {
+  readonly method: HttpMethod;
+  readonly path: string;
+  readonly payload: RequestPayload;
+  readonly signal: AbortSignal | undefined;
+  /** `Accept` header; `null` leaves the browser default (file downloads). */
+  readonly accept: string | null;
+}
+
+async function send(request: AuthorizedRequest, token: string | null): Promise<Response> {
+  const headers = new Headers();
+  if (request.accept !== null) headers.set('Accept', request.accept);
+  // Multipart bodies get no Content-Type here: the browser adds it with the boundary.
+  if (request.payload.kind === 'json') headers.set('Content-Type', 'application/json');
   if (token !== null) headers.set('Authorization', `Bearer ${token}`);
-  return fetch(path, {
-    method,
+  let body: BodyInit | null;
+  switch (request.payload.kind) {
+    case 'none':
+      body = null;
+      break;
+    case 'json':
+      body = JSON.stringify(request.payload.value);
+      break;
+    case 'form':
+      body = request.payload.value;
+      break;
+    default: {
+      const exhaustive: never = request.payload;
+      throw new Error(`Unhandled payload: ${JSON.stringify(exhaustive)}`);
+    }
+  }
+  return fetch(request.path, {
+    method: request.method,
     headers,
     credentials: 'same-origin',
-    body: options.body === undefined ? null : JSON.stringify(options.body),
-    signal: options.signal ?? null,
+    body,
+    signal: request.signal ?? null,
   });
 }
 
-async function readBody<T>(response: Response): Promise<T> {
-  // Callers of 204 endpoints use `T = undefined`; there is no body to parse.
-  if (response.status === 204) return undefined as T;
-  return (await response.json()) as T;
-}
-
 /**
- * Authenticated JSON request. Attaches the in-memory bearer token; on a 401 with
- * `TOKEN_EXPIRED` or `TOKEN_INVALID` it refreshes once and retries once. If the server rejects
- * the refresh (a 401 auth code) the session is cleared and the original `ApiError` is thrown.
- * Any other refresh failure (429, 5xx, network) keeps the session and throws the refresh error,
- * so the UI can offer a retry instead of signing the user out. A 204 resolves to `undefined`.
+ * Send with the in-memory bearer token and return the successful response. On a 401 with
+ * `TOKEN_EXPIRED` or `TOKEN_INVALID` it refreshes once and retries once with the same payload.
+ * If the server rejects the refresh (a 401 auth code) the session is cleared and the original
+ * `ApiError` is thrown. Any other refresh failure (429, 5xx, network) keeps the session and
+ * throws the refresh error, so the UI can offer a retry instead of signing the user out.
  */
-export async function apiRequest<T>(
-  method: HttpMethod,
-  path: string,
-  options: ApiRequestOptions = {},
-): Promise<T> {
+async function authorizedFetch(request: AuthorizedRequest): Promise<Response> {
   const usedToken = getAccessToken();
-  const response = await send(method, path, options, usedToken);
-  if (response.ok) return readBody<T>(response);
+  const response = await send(request, usedToken);
+  if (response.ok) return response;
 
   const error = await toApiError(response);
   if (error.status !== 401 || !REFRESHABLE_CODES.has(error.code)) throw error;
@@ -91,7 +109,69 @@ export async function apiRequest<T>(
     }
   }
 
-  const retried = await send(method, path, options, retryToken);
+  const retried = await send(request, retryToken);
   if (!retried.ok) throw await toApiError(retried);
-  return readBody<T>(retried);
+  return retried;
+}
+
+async function readBody<T>(response: Response): Promise<T> {
+  // Callers of 204 endpoints use `T = undefined`; there is no body to parse.
+  if (response.status === 204) return undefined as T;
+  return (await response.json()) as T;
+}
+
+/**
+ * Authenticated JSON request with the refresh-once behaviour of `authorizedFetch`. A 204
+ * resolves to `undefined`.
+ */
+export async function apiRequest<T>(
+  method: HttpMethod,
+  path: string,
+  options: ApiRequestOptions = {},
+): Promise<T> {
+  const payload: RequestPayload =
+    options.body === undefined ? { kind: 'none' } : { kind: 'json', value: options.body };
+  const response = await authorizedFetch({
+    method,
+    path,
+    payload,
+    signal: options.signal,
+    accept: 'application/json',
+  });
+  return readBody<T>(response);
+}
+
+export interface ApiTransferOptions {
+  signal?: AbortSignal;
+}
+
+/**
+ * Authenticated multipart POST of `formData`, answered with JSON. Same auth and refresh-once
+ * behaviour as `apiRequest`; the retry re-sends the same `FormData`.
+ */
+export async function apiUpload<T>(
+  path: string,
+  formData: FormData,
+  options: ApiTransferOptions = {},
+): Promise<T> {
+  const response = await authorizedFetch({
+    method: 'POST',
+    path,
+    payload: { kind: 'form', value: formData },
+    signal: options.signal,
+    accept: 'application/json',
+  });
+  return readBody<T>(response);
+}
+
+/** Authenticated GET of a file, resolved as a `Blob`. Errors still arrive as `ApiError`. */
+export async function apiDownload(path: string, options: ApiTransferOptions = {}): Promise<Blob> {
+  const response = await authorizedFetch({
+    method: 'GET',
+    path,
+    payload: { kind: 'none' },
+    signal: options.signal,
+    accept: null,
+  });
+  return response.blob();
 }

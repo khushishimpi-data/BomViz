@@ -1,0 +1,8 @@
+Sample BOM export - E2E fixture,,,,
+Part Number,Part Name,Qty,Parent Part Number,Unit Cost
+ASM-100,Drive Assembly,1,,120.00
+SUB-110,Motor Subassembly,1,ASM-100,45.50
+PRT-111,Motor Housing,1,SUB-110,12.25
+PRT-112,Rotor,1,SUB-110,18.00
+PRT-120,Mounting Bracket,2,ASM-100,3.75
+PRT-121,M6 Bolt,8,PRT-120,0.10

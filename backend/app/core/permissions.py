@@ -15,13 +15,15 @@ class Permission(StrEnum):
     WORKSPACE_MANAGE_MEMBERS = "workspace:manage_members"
     PRODUCT_READ = "product:read"
     PRODUCT_WRITE = "product:write"
+    BOM_READ = "bom:read"
+    BOM_UPLOAD = "bom:upload"
 
 
-_READ_ONLY = frozenset({Permission.WORKSPACE_READ, Permission.PRODUCT_READ})
+_READ_ONLY = frozenset({Permission.WORKSPACE_READ, Permission.PRODUCT_READ, Permission.BOM_READ})
 
 ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
     UserRole.ADMIN: frozenset(Permission),
-    UserRole.ENGINEER: _READ_ONLY | {Permission.PRODUCT_WRITE},
+    UserRole.ENGINEER: _READ_ONLY | {Permission.PRODUCT_WRITE, Permission.BOM_UPLOAD},
     UserRole.PROCUREMENT: _READ_ONLY,
     UserRole.PRODUCTION: _READ_ONLY,
     UserRole.VIEWER: _READ_ONLY,

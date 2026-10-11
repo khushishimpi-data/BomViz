@@ -8,7 +8,7 @@ import { WorkspaceQueryState } from './WorkspaceQueryState';
 
 const LINK_CLASS = 'font-medium text-primary underline-offset-4 hover:underline';
 
-/** Workspace index: name, slug, your role, and links to Products and Members. */
+/** Workspace index: name, slug, your role, and links to Products, BOMs and Members. */
 export function WorkspaceOverviewPage() {
   const { workspaceId, query } = useActiveWorkspace();
   const workspace = query.data;
@@ -31,6 +31,11 @@ export function WorkspaceOverviewPage() {
           <li>
             <Link to={`${base}/products`} className={LINK_CLASS}>
               Products
+            </Link>
+          </li>
+          <li>
+            <Link to={`${base}/boms`} className={LINK_CLASS}>
+              BOMs
             </Link>
           </li>
           <li>

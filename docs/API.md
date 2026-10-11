@@ -34,7 +34,7 @@ delivers them; ✅ marks a delivered phase, unmarked phases are planned.
 | Code | HTTP | Meaning |
 |---|---|---|
 | `VALIDATION_ERROR` | 422 | Request body or query failed schema validation (`details[].field`). Also returned by the register password policy (12–128 characters, must not equal the email, compared case-insensitively). |
-| `UNAUTHENTICATED` | 401 | No `Authorization: Bearer` header, or `/auth/refresh` called without a refresh cookie |
+| `UNAUTHENTICATED` | 401 | No `Authorization: Bearer` header, or `/auth/refresh` called without a refresh cookie. On `POST /boms/upload` every 401 is sent before the request body is read. |
 | `TOKEN_EXPIRED`, `TOKEN_INVALID` | 401 | The access token, or the refresh cookie on `/auth/refresh`, has expired or was rejected. A refresh cookie already revoked by logout is `TOKEN_INVALID`. |
 | `TOKEN_REUSED` | 401 | A refresh token that was already rotated (replaced by a successor) was presented; every session of that user is revoked |
 | `INVALID_CREDENTIALS` | 401 | Login failed. Wrong password, unknown email and inactive account all return this code |
@@ -47,12 +47,20 @@ delivers them; ✅ marks a delivered phase, unmarked phases are planned.
 | `SLUG_TAKEN` | 409 | Creating a workspace with a supplied slug that is already in use, or with a derived slug when all 5 suffixed attempts collide |
 | `PRODUCT_CODE_TAKEN` | 409 | The `product_code` already exists in the workspace |
 | `REVISION_CODE_TAKEN` | 409 | The `revision_code` already exists for the product |
-| `CONFLICT`, `INVALID_STATE`, `DUPLICATE_UPLOAD`, `VALIDATION_FAILED` | 409 | State conflicts |
-| `RATE_LIMITED` | 429 | A rate limit (per client IP, or per user for adding members) was exceeded; `Retry-After` gives the seconds to wait |
+| `DUPLICATE_UPLOAD` | 409 | Upload: the same bytes (SHA-256) are already uploaded to this workspace and not deleted; `details: [{existing_bom_id}]` |
+| `JOB_IN_PROGRESS` | 409 | Re-parse: a job is still queued or running for the BOM and is not stale yet |
+| `INVALID_STATE` | 409 | Re-parse: the BOM's status does not allow parsing (only `UPLOADED`, `PARSED`, `PARSE_FAILED` do) |
+| `NOT_PARSED` | 409 | Preview: the BOM is not `PARSED` |
+| `CONFLICT`, `VALIDATION_FAILED` | 409 | Other state conflicts (later phases) |
+| `RATE_LIMITED` | 429 | A rate limit (per client IP, or per user for adding members and uploading BOMs) was exceeded; `Retry-After` gives the seconds to wait |
 | `LOGIN_THROTTLED` | 429 | Too many failed logins for this (email, IP) pair; `Retry-After` gives the seconds to wait |
-| `UNSUPPORTED_FILE_TYPE` | 400 | Not `.csv`, `.xlsx` or `.xls` |
-| `FILE_TOO_LARGE` | 413 | Over 20 MB |
-| `INTERNAL_ERROR` | 500 | Unexpected failure; message is generic, `request_id` identifies the log entry |
+| `BAD_REQUEST` | 400 | Upload: the `Content-Length` header is not ASCII digits; sent before the body is read |
+| `EMPTY_FILE` | 400 | Upload: the file has no bytes |
+| `UNSUPPORTED_FILE_TYPE` | 400 | Upload: not `.csv`, `.xlsx` or `.xls`, or the contents do not match the extension (including a CSV with a UTF-16 byte-order mark whose start is not valid UTF-16) |
+| `ENCRYPTED_WORKBOOK` | 400 | Upload: an `.xlsx` that is an OLE container, which is how Excel stores a password-protected workbook |
+| `FILE_TOO_LARGE` | 413 | Upload: over 20 MB (`MAX_UPLOAD_BYTES`) |
+| `STORAGE_UNAVAILABLE` | 503 | Object storage is unreachable or rejected the request; the message is generic |
+| `INTERNAL_ERROR` | 500 | Unexpected failure; message is generic, `request_id` identifies the log entry. On upload this includes a database connection failure while committing, when it is unknown whether the BOM was stored (see the upload checks). |
 
 ## Endpoints
 
@@ -114,6 +122,8 @@ stores only its SHA-256 hash.
 | `POST /auth/login` | 30 per 15 minutes | client IP |
 | `POST /auth/refresh` | 60 per 15 minutes | client IP |
 | `POST /workspaces/{id}/members` | 30 per hour | acting user (bucket `member_add`) |
+| `POST /boms/upload`, before the body is read | 60 per hour | authenticated user (bucket `bom_upload_body`); every request counts, valid or not |
+| `POST /boms/upload`, after the permission check | 30 per hour | acting user (bucket `bom_upload`) |
 
 If Redis is unavailable, the limiter fails open and logs `rate_limiter_unavailable`.
 `RATE_LIMIT_ENABLED=false` turns the limits off.
@@ -220,15 +230,18 @@ decides access (see [Roles and permissions](#roles-and-permissions)).
 Roles are per workspace (`workspace_members.role`), so a user may hold a different role in each
 workspace. The policy lives in `backend/app/core/permissions.py` and denies by default.
 
-| Role | `workspace:read` | `workspace:manage_members` | `product:read` | `product:write` |
-|---|---|---|---|---|
-| `ADMIN` | yes | yes | yes | yes |
-| `ENGINEER` | yes | no | yes | yes |
-| `PROCUREMENT` | yes | no | yes | no |
-| `PRODUCTION` | yes | no | yes | no |
-| `VIEWER` | yes | no | yes | no |
+| Role | `workspace:read` | `workspace:manage_members` | `product:read` | `product:write` | `bom:read` | `bom:upload` |
+|---|---|---|---|---|---|---|
+| `ADMIN` | yes | yes | yes | yes | yes | yes |
+| `ENGINEER` | yes | no | yes | yes | yes | yes |
+| `PROCUREMENT` | yes | no | yes | no | yes | no |
+| `PRODUCTION` | yes | no | yes | no | yes | no |
+| `VIEWER` | yes | no | yes | no | yes | no |
 
-### Audit events (Phase 1)
+`bom:read` covers listing BOMs, their detail, the raw preview and downloading the original.
+`bom:upload` covers uploading and re-parsing.
+
+### Audit events (Phases 1–2)
 
 Audit rows are written in the same transaction as the change and carry the request's
 `request_id`. Failed logins, blocked attempts and refresh-token reuse are committed even though
@@ -249,28 +262,238 @@ the request fails. Phase 1 has no endpoint for reading audit logs.
 | `MEMBER_REMOVED` | A membership is deleted; metadata `{target_user_id, previous_role}` |
 | `PRODUCT_CREATED` | A product is created |
 | `PRODUCT_REVISION_CREATED` | A revision is created |
+| `BOM_UPLOADED` | A BOM file is uploaded; metadata `{file_format, size_bytes}` |
+| `BOM_PARSE_REQUESTED` | A re-parse is requested; metadata `{job_id}` |
+| `BOM_PARSED` | A parse job succeeds; metadata `{row_count, column_count}`. The actor is the user who requested the job. |
+| `BOM_PARSE_FAILED` | The worker fails a parse job (`PARSE_*` including the time limit, `ENCRYPTED_WORKBOOK`, `PARSE_INVALID_OPTIONS`, `INTERNAL_ERROR`, or `STORAGE_UNAVAILABLE` after the last storage retry); metadata `{error_code}`. A job failed with `QUEUE_UNAVAILABLE` or `STALE_JOB` is not audited. |
+| `BOM_FILE_DOWNLOADED` | A signed download URL for the original file is issued; no metadata |
 
-Audit metadata never contains emails, IP addresses, passwords, tokens or throttle key hashes.
+Audit metadata never contains emails, IP addresses, passwords, tokens or throttle key hashes,
+and BOM events never record the filename, checksum or signed URL.
 `AuditService.record` rejects keys that look like those as a programming error. For login
 events, the actor is the user when the email belongs to an account, and `NULL` otherwise.
 
-### BOM workflow (Phases 2–4)
+### BOM upload and parsing (Phase 2) ✅
+
+Every endpoint requires a bearer token. A BOM is resolved with one query that joins its
+workspace membership for the caller and skips soft-deleted rows. A BOM that does not exist, is
+deleted, or belongs to a workspace the caller is not a member of returns `404 NOT_FOUND`
+("BOM not found."). A member whose role lacks the permission gets `403 FORBIDDEN`. Job ids are
+never accepted from clients.
+
+| Method | Path | Permission | Body / query | Response |
+|---|---|---|---|---|
+| POST | `/boms/upload` | `bom:upload` on `workspace_id` | multipart, see below | `201 BomDetail`. Parsing starts automatically. |
+| GET | `/boms` | `bom:read` on `workspace_id` | `workspace_id` (required), `status?`, `product_id?`, `q?`, `limit`, `offset` | `200` page of `BomSummary`, newest first |
+| GET | `/boms/{id}` | `bom:read` | none | `200 BomDetail` |
+| GET | `/boms/{id}/file` | `bom:read` | none | `200 {url, expires_at}`. Audited as `BOM_FILE_DOWNLOADED`. |
+| POST | `/boms/{id}/parse` | `bom:upload` | `{sheet_name?, header_row?, delimiter?, encoding?}` (optional) | `202 Job`. Audited as `BOM_PARSE_REQUESTED`. |
+| GET | `/boms/{id}/preview` | `bom:read` | `stage=raw` (default) | `200 Preview` |
+| GET | `/templates/{csv\|xlsx}` | authenticated | none | `200` file download `bomviz-template.csv` or `bomviz-template.xlsx` |
+
+**Upload request** (`multipart/form-data`):
+
+| Field | Rule |
+|---|---|
+| `file` | `.csv`, `.xlsx` or `.xls`, 1 byte to 20 MB |
+| `workspace_id` | UUID of a workspace the caller belongs to |
+| `bom_name` | 1–200 characters after stripping |
+| `revision_label` | Optional, 1–64 characters after stripping |
+| `product_id` | Optional. Must be a product in the workspace, else `404 NOT_FOUND`. |
+| `product_revision_id` | Optional. Must be a revision of `product_id`, else `404 NOT_FOUND`. Without `product_id` it returns `422 VALIDATION_ERROR` (`details[].field` is `body.product_revision_id`). |
+
+The upload checks run in this order. Steps 1–3 run before a single byte of the body is read;
+when one of them fails, the response is sent without reading the body.
+
+1. The bearer token is checked exactly as on every other endpoint: `401 UNAUTHENTICATED`,
+   `TOKEN_EXPIRED` or `TOKEN_INVALID`.
+2. The body rate limit: 60 upload requests per hour per user (bucket `bom_upload_body`),
+   `429 RATE_LIMITED` with `Retry-After`. Every authenticated upload request counts, including
+   requests rejected by a later check.
+3. `Content-Length`, when present, must be ASCII digits only, else `400 BAD_REQUEST`. A declared
+   length above 20 MB plus 64 KB of form overhead returns `413 FILE_TOO_LARGE`. A body sent
+   without a length is cut off at the same size (`413 FILE_TOO_LARGE`).
+4. The multipart form is parsed and its fields are validated (`422 VALIDATION_ERROR`).
+5. Permission `bom:upload` on `workspace_id`: `404` for a non-member, `403` for a role without
+   it.
+6. The upload rate limit: 30 uploads per hour per user (bucket `bom_upload`), `429 RATE_LIMITED`
+   with `Retry-After`. Every attempt that passes the permission check counts, including attempts
+   rejected by a later check.
+7. Product and revision scope (see the table above). The read-only transaction is then ended,
+   so no transaction is held open while the file is copied or stored.
+8. The file is streamed to a temporary file while it is counted and hashed (SHA-256). More than
+   20 MB returns `413 FILE_TOO_LARGE`; zero bytes returns `400 EMPTY_FILE`.
+9. Format detection (below).
+10. Duplicate check (below). Its transaction is ended before the file is stored; the database
+    re-checks for a duplicate when the row is inserted.
+11. The original is stored, then the BOM row, a `PARSE` job (with the Celery task id the API
+    generated for it) and the `BOM_UPLOADED` audit row are committed. A storage failure returns
+    `503 STORAGE_UNAVAILABLE`. If the insert or its commit definitely fails, or the request is
+    cancelled after the object was stored and before the commit started, the stored object is
+    deleted again (best effort). If the database connection fails during the commit itself, it
+    is unknown whether the BOM was stored: the object is kept, the failure is logged, and the
+    response is `500 INTERNAL_ERROR`. If the BOM was stored in that case, it shows a `QUEUED`
+    parse job that never runs; once that job is stale (below), re-parse it.
+12. After the commit, the parse job is queued. If queueing fails and the job is still `QUEUED`,
+    the upload still returns `201`: the job is `FAILED` with `QUEUE_UNAVAILABLE`, the BOM is
+    `PARSE_FAILED`, and the user can re-parse.
+
+**Format detection.** The format comes from the file extension *and* the leading bytes. The
+client's content type is ignored.
+
+- `.xlsx` must start with `PK\x03\x04` (zip). An `.xlsx` that starts with the OLE signature
+  `D0 CF 11 E0 A1 B1 1A E1` returns `400 ENCRYPTED_WORKBOOK`, because that is how Excel stores a
+  password-protected workbook.
+- `.xls` must start with the OLE signature.
+- `.csv` must start with neither signature and must have no NUL byte in the first 64 KB. A CSV
+  that starts with a UTF-16 byte-order mark (`FF FE` or `FE FF`) is exempt from the NUL check,
+  because UTF-16 text is full of NUL bytes; instead, its first 64 KB must decode as strict
+  UTF-16 in the byte order of that mark (a character cut off at the 64 KB boundary is
+  tolerated).
+- Anything else, including a mismatch between extension and contents, returns
+  `400 UNSUPPORTED_FILE_TYPE`.
+
+**Duplicates.** Uploading bytes with the same SHA-256 as a non-deleted BOM in the same workspace
+returns `409 DUPLICATE_UPLOAD` with `details: [{existing_bom_id}]`. The same file may be uploaded
+to another workspace. When two uploads of the same file race, the database's partial unique
+index catches the second, and it also gets `409 DUPLICATE_UPLOAD`.
+
+**Stored filename.** `original_filename` is for display only. The client's filename is
+NFC-normalized, stripped of control, format, line-separator and paragraph-separator characters
+(Unicode categories `Cc`, `Cf`, `Zl`, `Zp`, which include bidi overrides and zero-width
+characters), reduced to its basename (`/` and `\` both separate paths), trimmed, and cut to at
+most 255 characters (truncation keeps the extension). If nothing usable is left (including `.`
+and `..`) it is `upload.<ext>`. The download's `Content-Disposition` filename uses the same
+sanitizer. The filename never appears in object keys.
+
+**List.** `q` is a case-insensitive substring match on `bom_name`, `original_filename` or
+`revision_label`. It is stripped and at most 200 characters (longer returns `422`), and `%`,
+`_` and `\` match literally. `status` is an `upload_status` value. Results are ordered by
+`uploaded_at`, newest first.
+
+**Download.** `GET /boms/{id}/file` returns a presigned S3 GET URL signed for
+`S3_PUBLIC_ENDPOINT_URL` (the internal endpoint when that is unset) and valid for
+`SIGNED_URL_TTL_SECONDS` (default 300). Storage answers that URL with the stored content type and
+`Content-Disposition: attachment; filename="…"; filename*=UTF-8''…`: an ASCII fallback plus the
+RFC 5987 encoded original filename, at most 150 characters. Each call is audited, so clients
+should request a fresh URL per download rather than cache one.
+
+**Re-parse.** The body is optional. An omitted or `null` option is detected from the file.
+Unknown fields are rejected.
+
+| Option | Rule |
+|---|---|
+| `sheet_name` | 1–255 characters. Excel only. An unknown sheet fails the job with `PARSE_SHEET_NOT_FOUND`. |
+| `header_row` | 1–1000, the 1-based source row of the header |
+| `delimiter` | `","`, `";"`, `"\t"` or `"\|"`. CSV only. |
+| `encoding` | `utf-8`, `utf-8-sig`, `utf-16`, `cp1252`, `latin-1` or `iso-8859-15`. CSV only. |
+
+Options that do not apply to the file's format are ignored.
+
+- Re-parse is allowed only while the BOM is `UPLOADED`, `PARSED` or `PARSE_FAILED`; otherwise
+  `409 INVALID_STATE`.
+- A job that is still `QUEUED` or `RUNNING` returns `409 JOB_IN_PROGRESS`, unless it is stale: a
+  `RUNNING` job whose `started_at`, or a `QUEUED` job whose `queued_at`, is more than 15 minutes
+  old (`JOB_STALE_AFTER_MINUTES`). A stale job is marked `FAILED` with `STALE_JOB` (a `PARSING`
+  BOM becomes `PARSE_FAILED`), and the request proceeds.
+- If the new job cannot be queued (and no worker picked it up anyway), it is still returned
+  with `202`, as `FAILED` / `QUEUE_UNAVAILABLE`, and the BOM becomes `PARSE_FAILED`.
+
+**Preview.** Returns the snapshot stored by the last successful parse, so the API never parses
+a file inside a request. A BOM that is not `PARSED` returns `409 NOT_PARSED`. While a re-parse
+is still `QUEUED` the BOM stays `PARSED` and the previous snapshot is returned; once the job
+runs the BOM is `PARSING` and the preview returns `409`. Clients should treat a preview as
+belonging to the parse job that produced it (the latest job, when it is a `SUCCEEDED` parse);
+the web app keys its cached preview by that job's id.
+`stage=normalized` returns `422 VALIDATION_ERROR` (`details[].field` is `query.stage`) until
+column mapping exists (Phase 3).
+
+**Response shapes.**
+
+- `Job` is `{id, job_type, status, attempts, error_code, error_message, queued_at, started_at,
+  finished_at}`. `job_type` is `PARSE` in Phase 2, and `status` is
+  `QUEUED | RUNNING | SUCCEEDED | FAILED`. `error_message` is user-safe text.
+- `BomSummary` is `{id, workspace_id, bom_name, revision_label, original_filename, file_format,
+  size_bytes, status, row_count, column_count, product_id, product_revision_id, uploaded_by_id,
+  uploaded_at, latest_job}`. `file_format` is `CSV | XLSX | XLS`. `row_count` and
+  `column_count` are `null` until the first successful parse. `latest_job` is a `Job` or `null`.
+- `BomDetail` is `BomSummary` plus `parse_options` and `jobs`, the last 10 jobs, newest first
+  (`latest_job` is the first of them). `parse_options` is
+  `{sheet_name, header_row, delimiter, encoding}`: the options the last successful parse
+  actually used, detected or explicit, or `null` before one. For CSV `sheet_name` is `null`;
+  for Excel `delimiter` and `encoding` are `null`.
+- `Preview` has these fields:
+
+  | Field | Content |
+  |---|---|
+  | `status` | The BOM status (`PARSED`) |
+  | `parse_options` | As in `BomDetail` |
+  | `sheets` | `[{name, visible}]` in workbook order, at most 50. Empty for CSV. |
+  | `columns` | `[{index, name}]`, where `index` is the 0-based source column |
+  | `row_count`, `column_count` | Non-empty data rows below the header, and columns |
+  | `skipped_empty_rows` | Fully empty rows below the header that were skipped |
+  | `rows` | The first 100 data rows as `[{row_number, cells}]`. `row_number` is the 1-based source row. `cells` holds one text per column, each cut to 500 characters. |
+  | `suggested_mapping` | One entry per column: `{source_column_index, source_column_name, target_field, confidence}`. `target_field` is a standard field key or `null`. `confidence` is 0–1 with 2 decimals, and `0.0` when unmapped. |
+  | `missing_required` | Keys of required fields that no column was mapped to |
+  | `target_fields` | All standard fields as `[{key, label, required}]`, in the order below |
+
+**Standard fields.** Required: `part_number`, `part_name`, `quantity`. Optional:
+`parent_part_number`, `bom_level`, `unit_of_measure`, `description`, `unit_cost`, `total_cost`,
+`currency`, `supplier_name`, `supplier_part_number`, `manufacturer_name`,
+`manufacturer_part_number`, `material`, `lead_time_days`, `reference_designator`, `notes`.
+Labels and synonyms live in `backend/app/domain/bom_fields.py`, and the suggestion rule is
+described in [ARCHITECTURE.md](ARCHITECTURE.md#upload-and-parsing-phase-2). In Phase 2 the
+mapping is only a suggestion; saving and editing it comes in Phase 3.
+
+**Templates.** `GET /templates/csv` and `GET /templates/xlsx` return a blank BOM template as an
+attachment (`bomviz-template.csv` or `bomviz-template.xlsx`). Its header row is the labels of
+the 18 standard fields, required fields first. Any signed-in user may download them; no
+workspace is involved.
+
+**Job error codes.** A failed job carries one of these codes in `error_code`, with a user-safe
+`error_message`:
+
+| Code | Meaning |
+|---|---|
+| `PARSE_ENCODING_UNKNOWN` | The CSV encoding could not be detected, or the file is not valid text in the chosen encoding |
+| `PARSE_CELL_TOO_LONG` | A cell is longer than 32,767 characters |
+| `PARSE_FILE_TOO_COMPLEX` | The `.xlsx` archive would expand beyond the safety limits (zip-bomb guard); a sheet has rows beyond row 1,048,576; too many empty rows (more than 10,000 in a row before the header, or more than max(10 × `PARSE_MAX_ROWS`, 100,000) below it); or the parse ran past the soft time limit ("The file took too long to parse.") |
+| `PARSE_FILE_CORRUPT` | The workbook is damaged or not a valid `.xlsx` / `.xls`, or the CSV is malformed |
+| `ENCRYPTED_WORKBOOK` | The workbook is password-protected |
+| `PARSE_SHEET_NOT_FOUND` | The requested `sheet_name` does not exist |
+| `PARSE_EMPTY_FILE` | The file or workbook contains no data |
+| `PARSE_NO_HEADER` | No header row in the first 20 non-empty rows, or the requested `header_row` is empty, past the end of the data, or (CSV) inside a multi-line record |
+| `PARSE_TOO_MANY_ROWS` | More than 50,000 data rows |
+| `PARSE_TOO_MANY_COLUMNS` | More than 200 columns with data, or a CSV record with more than 100,000 delimiter characters. Extra fields that are all empty are dropped instead. For `.xlsx`, only the first 201 columns are read (see below). |
+| `PARSE_INVALID_OPTIONS` | The job's stored options are invalid. Only possible if the row was written outside the API; re-parse. |
+| `QUEUE_UNAVAILABLE` | The job could not be handed to the queue; re-parse |
+| `STALE_JOB` | The job did not finish within 15 minutes and was replaced by a new parse request |
+| `STORAGE_UNAVAILABLE` | Object storage stayed unavailable through every retry; re-parse later |
+| `INTERNAL_ERROR` | Unexpected failure ("The file could not be parsed."): a crash in the parser, a missing original, the database still unreachable after the last retry, or a job that was started 3 times without finishing. Details are only in the worker log. |
+
+While a storage retry is pending, the job is back to `QUEUED` with `error_code`
+`STORAGE_UNAVAILABLE`. The code is cleared when the next attempt starts. `attempts` counts how
+often the job was started; retries and redeliveries reuse the same job. A job whose worker was
+killed (for example by the hard time limit) stays `RUNNING` until it is resumed or, after
+`JOB_STALE_AFTER_MINUTES`, replaced by a re-parse. How the worker owns, retries and fences jobs
+is described in [ARCHITECTURE.md](ARCHITECTURE.md#upload-and-parsing-phase-2).
+
+**Known limitation.** An `.xlsx` sheet is read through a window of 201 columns
+(`PARSE_MAX_COLUMNS + 1`). Data in column 201 fails the parse with `PARSE_TOO_MANY_COLUMNS`,
+but data further right is not read at all and is silently ignored. `.csv` and `.xls` files are
+checked in full.
+
+### BOM workflow (Phases 3–4)
 
 | Method | Path | Notes |
 |---|---|---|
-| POST | `/boms/upload` | multipart `file, workspace_id, bom_name, revision_label?, product_id?, product_revision_id?` |
-| GET | `/boms` | filters `workspace_id, status, product_id, q` |
-| GET | `/boms/{id}` | status, counts, jobs, mapping |
-| GET | `/boms/{id}/file` | `{url, expires_at}` signed download (audited) |
-| POST | `/boms/{id}/parse` | `{sheet_name?, header_row?, delimiter?, encoding?}` → `202 Job` |
-| GET | `/boms/{id}/preview` | `stage=raw\|normalized`, sheets, detected options, columns, suggested mapping, rows |
+| GET | `/boms/{id}/preview` | `stage=normalized` |
 | PUT | `/boms/{id}/mapping` | `{mappings: [{source_column_name, source_column_index, target_field, transformation?}]}` |
 | POST | `/boms/{id}/validate` | `202 Job` |
 | GET | `/boms/{id}/validation-report` | `format=json\|csv\|xlsx`, `scope=issues\|failed_rows` |
 | POST | `/boms/{id}/import` | `{accept_warnings, exclude_error_rows?, confirm_exclusion?}` → `202 Job` (see ADR 0001) |
 | POST | `/boms/{id}/retry` | Retry a `FAILED` job |
 | DELETE | `/boms/{id}` | Soft delete |
-| GET | `/templates/{csv\|xlsx}` | Blank BOM template |
 
 ### Visualization and analysis (Phases 5–6)
 

@@ -32,6 +32,54 @@ if (typeof HTMLDialogElement.prototype.showModal !== 'function') {
   });
 }
 
+function readBlob(blob: Blob): Promise<ArrayBuffer> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (reader.result instanceof ArrayBuffer) resolve(reader.result);
+      else reject(new Error('FileReader did not produce an ArrayBuffer.'));
+    };
+    reader.onerror = () => {
+      reject(reader.error ?? new Error('FileReader failed.'));
+    };
+    reader.readAsArrayBuffer(blob);
+  });
+}
+
+// jsdom's `Blob`/`File` lack `arrayBuffer()`, `text()` and `stream()`, so Node's `fetch` cannot
+// serialize a `File` inside `FormData` (the request body never finishes). Polyfill them for
+// every test; a no-op where the methods already exist.
+if (!('stream' in Blob.prototype)) {
+  Object.defineProperties(Blob.prototype, {
+    arrayBuffer: {
+      configurable: true,
+      writable: true,
+      value(this: Blob): Promise<ArrayBuffer> {
+        return readBlob(this);
+      },
+    },
+    text: {
+      configurable: true,
+      writable: true,
+      async value(this: Blob): Promise<string> {
+        return new TextDecoder().decode(await readBlob(this));
+      },
+    },
+    stream: {
+      configurable: true,
+      writable: true,
+      value(this: Blob): ReadableStream<Uint8Array> {
+        return new ReadableStream<Uint8Array>({
+          start: async (controller) => {
+            controller.enqueue(new Uint8Array(await readBlob(this)));
+            controller.close();
+          },
+        });
+      },
+    },
+  });
+}
+
 beforeAll(() => {
   server.listen({ onUnhandledRequest: 'error' });
 });

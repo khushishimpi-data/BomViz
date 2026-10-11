@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { server } from '@/tests/server';
 
-import { ApiError, apiRequest, getJson } from './api-client';
+import { ApiError, apiDownload, apiRequest, apiUpload, getJson } from './api-client';
 import { clearSession, getAccessToken, setSession, subscribe } from './auth-session';
 
 describe('getJson', () => {
@@ -272,5 +272,147 @@ describe('apiRequest', () => {
 
     expect(results).toEqual([{ ok: true }, { ok: true }, { ok: true }]);
     expect(refresh.counter.calls).toBe(1);
+  });
+});
+
+interface SeenUpload {
+  readonly authorization: string | null;
+  readonly contentType: string | null;
+  readonly name: FormDataEntryValue | null;
+  readonly fileText: string | null;
+}
+
+async function describeUpload(request: Request): Promise<SeenUpload> {
+  const form = await request.formData();
+  const file = form.get('file');
+  return {
+    authorization: request.headers.get('Authorization'),
+    contentType: request.headers.get('Content-Type'),
+    name: form.get('bom_name'),
+    fileText: file === null || typeof file === 'string' ? null : await file.text(),
+  };
+}
+
+function buildUploadForm(): FormData {
+  const form = new FormData();
+  form.append('bom_name', 'Pump BOM');
+  form.append('file', new File(['part_number,qty\nP-1,2\n'], 'pump.csv', { type: 'text/csv' }));
+  return form;
+}
+
+describe('apiUpload', () => {
+  afterEach(() => {
+    clearSession();
+  });
+
+  it('posts multipart form data with the bearer token and a browser-set boundary', async () => {
+    setSession('token-1');
+    const seen: SeenUpload[] = [];
+    server.use(
+      http.post('*/api/v1/uploads', async ({ request }) => {
+        seen.push(await describeUpload(request));
+        return HttpResponse.json({ id: 'bom-1' }, { status: 201 });
+      }),
+    );
+
+    await expect(apiUpload('/api/v1/uploads', buildUploadForm())).resolves.toEqual({
+      id: 'bom-1',
+    });
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatchObject({
+      authorization: 'Bearer token-1',
+      name: 'Pump BOM',
+      fileText: 'part_number,qty\nP-1,2\n',
+    });
+    expect(seen[0]?.contentType).toMatch(/^multipart\/form-data; boundary=/);
+    expect(seen[0]?.contentType).not.toContain('application/json');
+  });
+
+  it('refreshes once and re-sends the same form data after TOKEN_EXPIRED', async () => {
+    setSession('expired');
+    const seen: SeenUpload[] = [];
+    const refresh = countingRefresh('fresh-token');
+    server.use(
+      http.post('*/api/v1/uploads', async ({ request }) => {
+        const upload = await describeUpload(request);
+        seen.push(upload);
+        if (upload.authorization !== 'Bearer fresh-token') {
+          return HttpResponse.json(errorEnvelope('TOKEN_EXPIRED'), { status: 401 });
+        }
+        return HttpResponse.json({ id: 'bom-1' }, { status: 201 });
+      }),
+      refresh.handler,
+    );
+
+    await expect(apiUpload('/api/v1/uploads', buildUploadForm())).resolves.toEqual({
+      id: 'bom-1',
+    });
+    expect(refresh.counter.calls).toBe(1);
+    expect(seen.map((upload) => upload.authorization)).toEqual([
+      'Bearer expired',
+      'Bearer fresh-token',
+    ]);
+    expect(seen[1]).toMatchObject({ name: 'Pump BOM', fileText: 'part_number,qty\nP-1,2\n' });
+    expect(getAccessToken()).toBe('fresh-token');
+  });
+
+  it('turns a 4xx error envelope into ApiError without refreshing', async () => {
+    setSession('token-1');
+    const refresh = countingRefresh('fresh-token');
+    server.use(
+      http.post('*/api/v1/uploads', () =>
+        HttpResponse.json(errorEnvelope('UNSUPPORTED_FILE_TYPE', 'Unsupported file type.'), {
+          status: 400,
+        }),
+      ),
+      refresh.handler,
+    );
+
+    const error: unknown = await apiUpload('/api/v1/uploads', buildUploadForm()).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({
+      status: 400,
+      code: 'UNSUPPORTED_FILE_TYPE',
+      message: 'Unsupported file type.',
+    });
+    expect(refresh.counter.calls).toBe(0);
+  });
+});
+
+describe('apiDownload', () => {
+  afterEach(() => {
+    clearSession();
+  });
+
+  it('fetches a file as a Blob with the bearer token', async () => {
+    setSession('token-1');
+    let authorization: string | null = null;
+    server.use(
+      http.get('*/api/v1/files/1', ({ request }) => {
+        authorization = request.headers.get('Authorization');
+        return new HttpResponse('a,b\n', { headers: { 'Content-Type': 'text/csv' } });
+      }),
+    );
+
+    const blob = await apiDownload('/api/v1/files/1');
+
+    expect(await blob.text()).toBe('a,b\n');
+    expect(authorization).toBe('Bearer token-1');
+  });
+
+  it('throws ApiError for an error envelope', async () => {
+    server.use(
+      http.get('*/api/v1/files/1', () =>
+        HttpResponse.json(errorEnvelope('NOT_FOUND', 'Not found.'), { status: 404 }),
+      ),
+    );
+
+    await expect(apiDownload('/api/v1/files/1')).rejects.toMatchObject({
+      status: 404,
+      code: 'NOT_FOUND',
+    });
   });
 });

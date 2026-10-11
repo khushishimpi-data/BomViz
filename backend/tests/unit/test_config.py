@@ -79,3 +79,70 @@ def test_trusted_proxies_parsed_from_comma_separated_ips_and_cidrs() -> None:
 def test_invalid_trusted_proxy_entry_is_rejected(value: str) -> None:
     with pytest.raises(ValidationError, match="TRUSTED_PROXY_IPS"):
         make_settings(trusted_proxy_ips=value)
+
+
+def test_upload_and_parse_limits_have_documented_defaults() -> None:
+    settings = make_settings()
+
+    assert settings.max_upload_bytes == 20 * 1024 * 1024
+    assert settings.parse_max_rows == 50_000
+    assert settings.parse_max_columns == 200
+    assert settings.parse_max_cell_chars == 32_767
+    assert settings.parse_sample_rows == 100
+    assert settings.parse_max_uncompressed_bytes == 200 * 1024 * 1024
+    assert settings.job_stale_after_minutes == 15
+
+
+def test_upload_and_parse_limits_can_be_overridden_by_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MAX_UPLOAD_BYTES", "1024")
+    monkeypatch.setenv("PARSE_MAX_ROWS", "10")
+    monkeypatch.setenv("PARSE_MAX_COLUMNS", "5")
+    monkeypatch.setenv("PARSE_MAX_CELL_CHARS", "50")
+    monkeypatch.setenv("PARSE_SAMPLE_ROWS", "3")
+    monkeypatch.setenv("PARSE_MAX_UNCOMPRESSED_BYTES", "4096")
+    monkeypatch.setenv("JOB_STALE_AFTER_MINUTES", "1")
+    monkeypatch.setenv("PARSE_SOFT_TIME_LIMIT_SECONDS", "30")
+    monkeypatch.setenv("PARSE_HARD_TIME_LIMIT_SECONDS", "45")
+
+    settings = make_settings()
+
+    assert settings.max_upload_bytes == 1024
+    assert settings.parse_max_rows == 10
+    assert settings.parse_max_columns == 5
+    assert settings.parse_max_cell_chars == 50
+    assert settings.parse_sample_rows == 3
+    assert settings.parse_max_uncompressed_bytes == 4096
+    assert settings.job_stale_after_minutes == 1
+    assert settings.parse_soft_time_limit_seconds == 30
+    assert settings.parse_hard_time_limit_seconds == 45
+
+
+def test_parse_time_limits_default_to_ten_and_eleven_minutes() -> None:
+    settings = make_settings()
+
+    assert settings.parse_soft_time_limit_seconds == 600
+    assert settings.parse_hard_time_limit_seconds == 660
+
+
+def test_a_soft_parse_time_limit_reaching_the_stale_job_age_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="JOB_STALE_AFTER_MINUTES"):
+        make_settings(job_stale_after_minutes=10, parse_soft_time_limit_seconds=600)
+
+
+def test_a_hard_parse_time_limit_not_above_the_soft_limit_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="PARSE_HARD_TIME_LIMIT_SECONDS"):
+        make_settings(parse_soft_time_limit_seconds=600, parse_hard_time_limit_seconds=600)
+
+
+def test_a_non_positive_soft_parse_time_limit_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="PARSE_SOFT_TIME_LIMIT_SECONDS"):
+        make_settings(parse_soft_time_limit_seconds=0)
+
+
+def test_non_integer_upload_limit_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MAX_UPLOAD_BYTES", "20MB")
+
+    with pytest.raises(ValidationError, match="max_upload_bytes"):
+        make_settings()

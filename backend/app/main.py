@@ -11,13 +11,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from redis.asyncio import Redis
 
 from app import __version__
-from app.api import auth, health, products, workspaces
+from app.api import auth, boms, health, products, templates, workspaces
 from app.core.config import Settings, get_settings
 from app.core.exceptions import register_exception_handlers
 from app.core.logging import configure_logging
 from app.core.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
 from app.db.session import build_engine, build_sessionmaker
+from app.services.celery_job_queue import CeleryJobQueue
 from app.services.storage_service import ObjectStorage
+from app.workers.factory import create_celery_app
 
 
 @asynccontextmanager
@@ -30,9 +32,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.sessionmaker = build_sessionmaker(engine)
     app.state.redis = redis
     app.state.storage = ObjectStorage(settings)
+    # Built from this app's settings; nothing connects to the broker until a job is enqueued.
+    celery = create_celery_app(settings)
+    app.state.job_queue = CeleryJobQueue(celery)
     try:
         yield
     finally:
+        celery.close()
         await redis.aclose()
         await engine.dispose()
 
@@ -67,4 +73,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(auth.router, prefix=settings.api_v1_prefix)
     app.include_router(workspaces.router, prefix=settings.api_v1_prefix)
     app.include_router(products.router, prefix=settings.api_v1_prefix)
+    app.include_router(boms.router, prefix=settings.api_v1_prefix)
+    app.include_router(templates.router, prefix=settings.api_v1_prefix)
     return app
