@@ -422,11 +422,21 @@ original into a private temporary directory and parses it there.
   with data. Sheets are probed only up to their first non-empty row, and the chosen sheet's
   rows continue from there, so no sheet is read twice. No data anywhere means
   `PARSE_EMPTY_FILE`.
-- **Header.** An explicit `header_row`, else the first row within the first 20 non-empty rows
-  that has at least two filled cells, at least half of them non-numeric. Otherwise
-  `PARSE_NO_HEADER`. Blank names become `Column N`, repeats become `Name (2)`, `Name (3)`.
+- **Header.** An explicit `header_row` wins. Otherwise the parse job scores each of the first 30
+  non-empty rows by how many distinct standard BOM fields its cells match (the same matcher as
+  the mapping suggestions, threshold 0.8) and takes the best row scoring at least 2; ties go to
+  the row with more text cells, then the earlier row. This skips key/value information blocks
+  above the table. The parser itself stays free of mapping code: the scorer is injected into
+  `parse_file`. When no row scores 2, it falls back to the first row within the first 20
+  non-empty rows that has at least two filled cells, at least half of them non-numeric.
+  Otherwise `PARSE_NO_HEADER`. Blank names become `Column N`, repeats become `Name (2)`, `Name (3)`.
   Trailing columns empty in the header and every row are dropped, and fully empty rows are
   skipped and counted.
+- **Formulas without saved values.** For XLSX, the parser streams the chosen sheet's XML (through
+  defusedxml, after the archive checks) and counts formula cells below the header that have no
+  saved value, for example a workbook written by a script and never opened in Excel. The count
+  is stored in the snapshot as `formula_cells_without_value` and the preview shows a warning,
+  because those cells read as empty. CSV and XLS report 0.
 - **Cell text.** Strings lose a trailing `\r`. Integers stay integers, and floats are written
   without float noise or exponent (`4.0` → `4`). Booleans become `TRUE`/`FALSE`, dates and
   datetimes ISO 8601 (a midnight datetime as a date), empty cells `""`.

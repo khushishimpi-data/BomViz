@@ -21,6 +21,7 @@ from app.services.parsing.cells import cell_to_text
 from app.services.parsing.errors import ParseError, ParseErrorCode
 from app.services.parsing.header import (
     EXCEL_MAX_ROWS,
+    HeaderScorer,
     RowSource,
     SheetInfo,
     WorkbookTable,
@@ -54,7 +55,12 @@ _EMPTY_TYPES = frozenset({xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK})
 
 
 def read_xls(
-    path: Path, *, sheet_name: str | None, header_row: int | None, limits: ParseLimits
+    path: Path,
+    *,
+    sheet_name: str | None,
+    header_row: int | None,
+    limits: ParseLimits,
+    header_scorer: HeaderScorer | None = None,
 ) -> WorkbookTable:
     """Parse one sheet of an .xls workbook; dates use the workbook's own date system."""
     with Path(os.devnull).open("w") as quiet:
@@ -69,13 +75,17 @@ def read_xls(
         except _CORRUPT_ERRORS as exc:
             raise ParseError(ParseErrorCode.FILE_CORRUPT, _CORRUPT_MESSAGE) from exc
         try:
-            return _read_book(book, sheet_name, header_row, limits)
+            return _read_book(book, sheet_name, header_row, limits, header_scorer)
         finally:
             book.release_resources()
 
 
 def _read_book(
-    book: Book, sheet_name: str | None, header_row: int | None, limits: ParseLimits
+    book: Book,
+    sheet_name: str | None,
+    header_row: int | None,
+    limits: ParseLimits,
+    header_scorer: HeaderScorer | None,
 ) -> WorkbookTable:
     names = book.sheet_names()
     # Visibility is read from the workbook globals so hidden sheets need not be loaded.
@@ -91,7 +101,7 @@ def _read_book(
     chosen, rows = select_sheet(
         sheets, sheet_name, lambda name: _iter_rows(book, _load_sheet(book, name), limits), limits
     )
-    table = build_table(rows, header_row, limits)
+    table = build_table(rows, header_row, limits, header_scorer)
     return WorkbookTable(sheets=sheets[: limits.max_sheets_listed], sheet_name=chosen, table=table)
 
 

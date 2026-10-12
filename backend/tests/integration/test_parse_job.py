@@ -232,6 +232,7 @@ async def test_a_csv_job_stores_the_preview_snapshot(env: Env) -> None:
         "row_count": 2,
         "column_count": 3,
         "skipped_empty_rows": 1,
+        "formula_cells_without_value": 0,
         "rows": [
             {"row_number": 2, "cells": ["P-1", "Bolt", "4"]},
             {"row_number": 4, "cells": ["P-2", "Nut", "2"]},
@@ -296,6 +297,32 @@ async def test_an_xlsx_job_picks_the_first_sheet_with_data(env: Env, tmp_path: P
         {"row_number": 2, "cells": ["P-1", "Bolt", "4"]},
         {"row_number": 3, "cells": ["P-2", "Nut", "2.5"]},
     ]
+    assert bom.parse_result["missing_required"] == []
+
+
+async def test_an_xlsx_job_finds_the_table_below_an_information_block_and_counts_formulas(
+    env: Env, tmp_path: Path
+) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    assert sheet is not None
+    sheet.append(["Product", "Electric Table Fan"])
+    sheet.append(["Revision", "A"])
+    sheet.append([])
+    sheet.append(["Item Code", "Component", "Qty per Unit", "Unit Cost", "Extended Cost"])
+    sheet.append(["RM-001", "Front grill", 1, 85, "=C5*D5"])
+    sheet.append(["RM-002", "Rear grill", 1, 80, "=C6*D6"])
+    path = tmp_path / "fan.xlsx"
+    workbook.save(path)
+    job = await _queued_job(env, path.read_bytes(), FileFormat.XLSX)
+
+    await _run(env, job)
+
+    _, bom = await _reload(env, job)
+    assert bom.parse_options is not None
+    assert bom.parse_options["header_row"] == 4
+    assert bom.parse_result is not None
+    assert bom.parse_result["formula_cells_without_value"] == 2
     assert bom.parse_result["missing_required"] == []
 
 

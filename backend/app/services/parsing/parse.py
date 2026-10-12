@@ -6,7 +6,7 @@ from typing import Self
 
 from app.core.config import Settings
 from app.services.parsing import csv_parser, xls_parser, xlsx_parser
-from app.services.parsing.header import ColumnInfo, SampleRow, SheetInfo
+from app.services.parsing.header import ColumnInfo, HeaderScorer, SampleRow, SheetInfo
 
 ALLOWED_DELIMITERS: frozenset[str] = frozenset({",", ";", "\t", "|"})
 ALLOWED_ENCODINGS: tuple[str, ...] = (
@@ -63,6 +63,8 @@ class ParseLimits:
     max_sheets_listed: int = 50
     sample_cell_chars: int = 500
     header_scan_rows: int = 20
+    # Non-empty rows scored when a header scorer is given (see `build_table`).
+    header_score_scan_rows: int = 30
     # Consecutive empty rows tolerated before the header is found.
     max_leading_empty_rows: int = 10_000
     # Empty rows tolerated below the header: max(10 x max_rows, 100,000).
@@ -88,6 +90,8 @@ class ParseOutcome:
 
     `effective_options` records what was actually used (detected or explicit), so a re-parse
     with these options reproduces the same result. `sheets` is empty for CSV.
+    `formula_cells_without_value` counts formula cells (header row down) whose cached value is
+    missing, so they read as empty; always 0 for CSV and XLS.
     """
 
     effective_options: ParseOptions
@@ -97,6 +101,7 @@ class ParseOutcome:
     column_count: int
     sample_rows: list[SampleRow] = field(default_factory=list)
     skipped_empty_rows: int = 0
+    formula_cells_without_value: int = 0
 
 
 def parse_file(
@@ -104,9 +109,13 @@ def parse_file(
     file_format: str,
     options: ParseOptions | None = None,
     limits: ParseLimits | None = None,
+    header_scorer: HeaderScorer | None = None,
 ) -> ParseOutcome:
     """Parse the file at `path` (`CSV`, `XLSX` or `XLS`) into a bounded preview outcome.
 
+    `header_scorer` (optional) counts the standard fields a row names; when given and no
+    `header_row` is set, the best-scoring row becomes the header (see `build_table`). It is
+    injected so this package stays independent of the mapping rules.
     Raises `ParseError` for every user-actionable failure.
     """
     opts = options or ParseOptions()
@@ -119,6 +128,7 @@ def parse_file(
                 encoding=opts.encoding,
                 header_row=opts.header_row,
                 limits=lim,
+                header_scorer=header_scorer,
             )
             table = csv_result.table
             effective = ParseOptions(
@@ -127,12 +137,20 @@ def parse_file(
                 encoding=csv_result.encoding,
             )
             sheets: list[SheetInfo] = []
+            formula_cells_without_value = 0
         case "XLSX" | "XLS":
             reader = xlsx_parser.read_xlsx if file_format.upper() == "XLSX" else xls_parser.read_xls
-            book = reader(path, sheet_name=opts.sheet_name, header_row=opts.header_row, limits=lim)
+            book = reader(
+                path,
+                sheet_name=opts.sheet_name,
+                header_row=opts.header_row,
+                limits=lim,
+                header_scorer=header_scorer,
+            )
             table = book.table
             effective = ParseOptions(sheet_name=book.sheet_name, header_row=table.header_row)
             sheets = book.sheets
+            formula_cells_without_value = book.formula_cells_without_value
         case _:
             raise ValueError(f"unsupported file format {file_format!r}")
     return ParseOutcome(
@@ -143,4 +161,5 @@ def parse_file(
         column_count=table.column_count,
         sample_rows=table.sample_rows,
         skipped_empty_rows=table.skipped_empty_rows,
+        formula_cells_without_value=formula_cells_without_value,
     )

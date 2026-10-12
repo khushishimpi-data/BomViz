@@ -432,6 +432,7 @@ column mapping exists (Phase 3).
   | `columns` | `[{index, name}]`, where `index` is the 0-based source column |
   | `row_count`, `column_count` | Non-empty data rows below the header, and columns |
   | `skipped_empty_rows` | Fully empty rows below the header that were skipped |
+  | `formula_cells_without_value` | XLSX formula cells below the header that have no saved value (0 for CSV and XLS, and for snapshots written before this field existed) |
   | `rows` | The first 100 data rows as `[{row_number, cells}]`. `row_number` is the 1-based source row. `cells` holds one text per column, each cut to 500 characters. |
   | `suggested_mapping` | One entry per column: `{source_column_index, source_column_name, target_field, confidence}`. `target_field` is a standard field key or `null`. `confidence` is 0–1 with 2 decimals, and `0.0` when unmapped. |
   | `missing_required` | Keys of required fields that no column was mapped to |

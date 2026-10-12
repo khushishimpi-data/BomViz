@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from app.services.mapping_suggestions import count_standard_field_matches
 from app.services.parsing import (
     ParseError,
     ParseErrorCode,
@@ -300,3 +301,15 @@ def test_many_blank_lines_before_the_header_fail(tmp_path: Path) -> None:
         parse_file(path, "CSV", limits=ParseLimits(max_leading_empty_rows=10))
 
     assert exc.value.code is ParseErrorCode.FILE_TOO_COMPLEX
+
+
+def test_header_scorer_picks_the_table_below_a_key_value_block(tmp_path: Path) -> None:
+    text = "Product,Fan\r\nRevision,A\r\n\r\nItem Code,Component,Qty\r\nRM-001,Grill,1\r\n"
+
+    outcome = parse_file(
+        write(tmp_path, text.encode()), "CSV", header_scorer=count_standard_field_matches
+    )
+
+    assert outcome.effective_options.header_row == 4
+    assert [c.name for c in outcome.columns] == ["Item Code", "Component", "Qty"]
+    assert outcome.formula_cells_without_value == 0

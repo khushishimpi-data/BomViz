@@ -27,7 +27,7 @@ from charset_normalizer import from_bytes
 
 from app.services.parsing.cells import cell_to_text
 from app.services.parsing.errors import ParseError, ParseErrorCode
-from app.services.parsing.header import Row, TableShape, build_table
+from app.services.parsing.header import HeaderScorer, Row, TableShape, build_table
 
 if TYPE_CHECKING:
     from app.services.parsing.parse import ParseLimits
@@ -61,6 +61,7 @@ def read_csv(
     encoding: str | None,
     header_row: int | None,
     limits: ParseLimits,
+    header_scorer: HeaderScorer | None = None,
 ) -> CsvTable:
     """Parse a CSV file. Explicit `delimiter`/`encoding` win over detection."""
     used_encoding = encoding or detect_encoding(path)
@@ -71,6 +72,7 @@ def read_csv(
                 _iter_rows(path, used_encoding, used_delimiter, limits),
                 header_row,
                 limits,
+                header_scorer,
             )
         except UnicodeDecodeError as exc:
             raise _decode_error(used_encoding) from exc

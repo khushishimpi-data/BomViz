@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import zipfile
 import zlib
+from collections.abc import Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING
+from xml.etree.ElementTree import Element
 from xml.etree.ElementTree import ParseError as XmlParseError
 
+from defusedxml.ElementTree import iterparse as _defused_iterparse  # type: ignore[import-untyped]
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 from openpyxl.worksheet._read_only import ReadOnlyWorksheet
@@ -23,6 +26,7 @@ from app.services.parsing.cells import cell_to_text
 from app.services.parsing.errors import ParseError, ParseErrorCode
 from app.services.parsing.header import (
     EXCEL_MAX_ROWS,
+    HeaderScorer,
     RowSource,
     SheetInfo,
     WorkbookTable,
@@ -56,23 +60,108 @@ _CORRUPT_ERRORS = (
     zlib.error,
 )
 
+# SpreadsheetML namespaces: transitional (what Excel writes) and strict.
+_SHEET_NAMESPACES = frozenset(
+    {
+        "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "http://purl.oclc.org/ooxml/spreadsheetml/main",
+    }
+)
+
 _CORRUPT_MESSAGE = "The Excel file is damaged or is not a valid .xlsx workbook."
 _ENCRYPTED_MESSAGE = "The workbook is password-protected. Remove the password and upload it again."
 
 
 def read_xlsx(
-    path: Path, *, sheet_name: str | None, header_row: int | None, limits: ParseLimits
+    path: Path,
+    *,
+    sheet_name: str | None,
+    header_row: int | None,
+    limits: ParseLimits,
+    header_scorer: HeaderScorer | None = None,
 ) -> WorkbookTable:
-    """Parse one sheet of an .xlsx workbook (cached formula values, never formulas)."""
+    """Parse one sheet of an .xlsx workbook (cached formula values, never formulas).
+
+    Also counts the chosen sheet's formula cells, from the header row down, that have no cached
+    value: they read as empty, and the preview warns about them.
+    """
     inspect_archive(path, limits)
     try:
         workbook = load_workbook(path, read_only=True, data_only=True, keep_links=False)
     except _CORRUPT_ERRORS as exc:
         raise ParseError(ParseErrorCode.FILE_CORRUPT, _CORRUPT_MESSAGE) from exc
     try:
-        return _read_workbook(workbook, sheet_name, header_row, limits)
+        book, sheet_path = _read_workbook(workbook, sheet_name, header_row, limits, header_scorer)
     finally:
         workbook.close()
+    if sheet_path is None:
+        return book
+    missing = count_formula_cells_without_value(path, sheet_path, book.table.header_row)
+    return WorkbookTable(
+        sheets=book.sheets,
+        sheet_name=book.sheet_name,
+        table=book.table,
+        formula_cells_without_value=missing,
+    )
+
+
+def count_formula_cells_without_value(path: Path, sheet_path: str, from_row: int) -> int:
+    """Cells at or below `from_row` with a formula (`<f>`) but no cached value (`<v>`).
+
+    Streams the sheet's XML member through defusedxml, keeping one row in memory at a time.
+    Call only after `inspect_archive`, which bounds the member's expanded size.
+    """
+    try:
+        with zipfile.ZipFile(path) as archive, archive.open(sheet_path.lstrip("/")) as member:
+            return _count_in_sheet_xml(member, from_row)
+    except _CORRUPT_ERRORS as exc:
+        raise ParseError(ParseErrorCode.FILE_CORRUPT, _CORRUPT_MESSAGE) from exc
+
+
+def _count_in_sheet_xml(source: IO[bytes], from_row: int) -> int:
+    count = 0
+    row_number = 0
+    sheet_data: Element | None = None
+    events: Iterator[tuple[str, Element]] = _defused_iterparse(source, events=("start", "end"))
+    for event, element in events:
+        name = _local_name(element.tag)
+        if event == "start":
+            if name == "sheetData":
+                sheet_data = element
+            elif name == "row":
+                row_number = _row_number(element.get("r"), row_number + 1)
+            continue
+        if name == "c" and row_number >= from_row and _lacks_cached_value(element):
+            count += 1
+        elif name == "row" and sheet_data is not None:
+            # Rows are done with once counted; dropping them bounds memory to one row.
+            sheet_data.clear()
+    return count
+
+
+def _local_name(tag: str) -> str | None:
+    """The element's local name when it is in a SpreadsheetML namespace, else `None`."""
+    namespace, _, local = tag[1:].partition("}") if tag.startswith("{") else ("", "", tag)
+    return local if namespace in _SHEET_NAMESPACES else None
+
+
+def _row_number(declared: str | None, implied: int) -> int:
+    """The row's `r` attribute, or the row after the previous one when it is absent."""
+    if declared is not None and declared.isdigit():
+        return int(declared)
+    return implied
+
+
+def _lacks_cached_value(cell: Element) -> bool:
+    has_formula = False
+    has_value = False
+    for child in cell:
+        name = _local_name(child.tag)
+        if name == "f":
+            has_formula = True
+        elif name == "v" and child.text:
+            has_value = True
+    return has_formula and not has_value
 
 
 def inspect_archive(path: Path, limits: ParseLimits) -> None:
@@ -114,8 +203,13 @@ def _over_ratio(uncompressed: int, compressed: int, limits: ParseLimits) -> bool
 
 
 def _read_workbook(
-    workbook: Workbook, sheet_name: str | None, header_row: int | None, limits: ParseLimits
-) -> WorkbookTable:
+    workbook: Workbook,
+    sheet_name: str | None,
+    header_row: int | None,
+    limits: ParseLimits,
+    header_scorer: HeaderScorer | None,
+) -> tuple[WorkbookTable, str | None]:
+    """The chosen sheet's table and the path of its XML member inside the archive."""
     worksheets = {ws.title: ws for ws in workbook.worksheets if isinstance(ws, ReadOnlyWorksheet)}
     sheets = [
         SheetInfo(name=title, visible=ws.sheet_state == "visible")
@@ -124,8 +218,12 @@ def _read_workbook(
     chosen, rows = select_sheet(
         sheets, sheet_name, lambda name: _iter_rows(worksheets[name], limits), limits
     )
-    table = build_table(rows, header_row, limits)
-    return WorkbookTable(sheets=sheets[: limits.max_sheets_listed], sheet_name=chosen, table=table)
+    table = build_table(rows, header_row, limits, header_scorer)
+    book = WorkbookTable(sheets=sheets[: limits.max_sheets_listed], sheet_name=chosen, table=table)
+    # openpyxl keeps the member path of a read-only sheet privately; it is the path its own
+    # relationship resolution found for the sheet.
+    sheet_path = getattr(worksheets[chosen], "_worksheet_path", None)
+    return book, sheet_path if isinstance(sheet_path, str) else None
 
 
 def _iter_rows(worksheet: ReadOnlyWorksheet, limits: ParseLimits) -> RowSource:

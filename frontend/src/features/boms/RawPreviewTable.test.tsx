@@ -82,4 +82,79 @@ describe('RawPreviewTable', () => {
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
     expect(screen.queryByText(/skipped/)).not.toBeInTheDocument();
   });
+  describe('formula cells without a saved value', () => {
+    const advice = 'Open the file in Excel, save it, and upload it again.';
+
+    it('shows no formula warning when every formula has a saved value', () => {
+      render(<RawPreviewTable preview={buildPreview({ formula_cells_without_value: 0 })} />);
+
+      expect(screen.queryByText(/formula cell/)).not.toBeInTheDocument();
+    });
+
+    it('shows no formula warning when an older response omits the count', () => {
+      const preview = { ...buildPreview({ missing_required: [] }) };
+      delete preview.formula_cells_without_value;
+      render(<RawPreviewTable preview={preview} />);
+
+      expect(screen.queryByText(/formula cell/)).not.toBeInTheDocument();
+      expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    });
+
+    it('uses the singular wording for one cell', () => {
+      render(
+        <RawPreviewTable
+          preview={buildPreview({ formula_cells_without_value: 1, missing_required: [] })}
+        />,
+      );
+
+      const warning = screen.getByRole('status');
+      expect(warning).toHaveTextContent('Formulas without saved values');
+      expect(warning).toHaveTextContent(
+        `1 formula cell has no saved value, so it appears empty. ${advice}`,
+      );
+      expect(warning).not.toHaveTextContent('formula cells');
+    });
+
+    it('uses the plural wording and a locale-formatted count for many cells', () => {
+      render(
+        <RawPreviewTable
+          preview={buildPreview({ formula_cells_without_value: 1_234, missing_required: [] })}
+        />,
+      );
+
+      expect(screen.getByRole('status')).toHaveTextContent(
+        `1,234 formula cells have no saved value, so they appear empty. ${advice}`,
+      );
+    });
+
+    it('shows 56 cells in the plural', () => {
+      render(
+        <RawPreviewTable
+          preview={buildPreview({ formula_cells_without_value: 56, missing_required: [] })}
+        />,
+      );
+
+      const warning = screen.getByRole('status');
+      expect(warning).toHaveTextContent(
+        `56 formula cells have no saved value, so they appear empty. ${advice}`,
+      );
+      expect(warning).not.toHaveTextContent('formula cell has');
+    });
+
+    it('shows alongside the missing-required warning', () => {
+      render(
+        <RawPreviewTable
+          preview={buildPreview({
+            formula_cells_without_value: 56,
+            missing_required: ['part_name'],
+          })}
+        />,
+      );
+
+      const warnings = screen.getAllByRole('status');
+      expect(warnings).toHaveLength(2);
+      expect(warnings[0]).toHaveTextContent('Required fields not found');
+      expect(warnings[1]).toHaveTextContent('56 formula cells have no saved value');
+    });
+  });
 });

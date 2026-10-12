@@ -1,7 +1,8 @@
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import pytest
 
+from app.services.mapping_suggestions import count_standard_field_matches
 from app.services.parsing import ParseError, ParseErrorCode, ParseLimits
 from app.services.parsing.header import Row, build_table, looks_like_header, name_columns
 
@@ -242,3 +243,163 @@ def test_explicit_header_row_that_does_not_start_a_row_fails() -> None:
         build_table(rows, 2, LIMITS)
 
     assert exc.value.code is ParseErrorCode.NO_HEADER
+
+
+# --- header detection by standard-field matches ----------------------------------------------
+
+FAN_HEADER = [
+    "Level",
+    "Item Code",
+    "Component / Material",
+    "Specification / Notes",
+    "UOM",
+    "Qty per Finished Unit",
+    "Scrap %",
+    "Effective Qty per Unit",
+    "Batch Qty Required",
+    "Unit Cost (₹)",
+]
+
+
+def fan_rows() -> list[Row]:
+    """A title and a key/value information block above the table, as in manufacturing exports."""
+    return numbered(
+        ["MANUFACTURING BILL OF MATERIALS"],
+        [],
+        ["Product", "Electric Table Fan — 400 mm"],
+        ["Finished Good Code", "FG-FAN-400"],
+        ["BOM Revision", "A"],
+        ["BOM Type", "Manufacturing BOM"],
+        ["Production Batch Size (units)", "100"],
+        ["Currency", "INR (₹)"],
+        [],
+        FAN_HEADER,
+        ["1", "RM-001", "Front grill", "Steel wire", "Nos", "1", "0.02", "", "", "85"],
+        ["1", "RM-002", "Rear grill", "Steel wire", "Nos", "1", "0.02", "", "", "80"],
+    )
+
+
+def scores_from(table: dict[str, int]) -> Callable[[Sequence[str]], int]:
+    """A scorer that knows a fixed score per first cell (0 for anything else)."""
+    return lambda cells: table.get(cells[0], 0) if cells else 0
+
+
+def test_scored_detection_skips_an_information_block_above_the_table() -> None:
+    table = build_table(fan_rows(), None, LIMITS, count_standard_field_matches)
+
+    assert table.header_row == 10
+    assert [c.name for c in table.columns] == FAN_HEADER
+    assert [r.row_number for r in table.sample_rows] == [11, 12]
+    assert table.row_count == 2
+
+
+def test_without_a_scorer_the_information_block_is_taken_as_the_header() -> None:
+    assert build_table(fan_rows(), None, LIMITS).header_row == 3
+
+
+def test_scored_detection_keeps_a_header_on_the_first_row() -> None:
+    rows = numbered(["Part Number", "Name", "Qty"], ["A-1", "Bolt", "2"], ["A-2", "Nut", "4"])
+
+    table = build_table(rows, None, LIMITS, count_standard_field_matches)
+
+    assert table.header_row == 1
+    assert table.row_count == 2
+
+
+def test_rows_scoring_below_two_fall_back_to_the_text_heuristic() -> None:
+    rows = numbered(["Assembly BOM"], ["Colour", "Shade"], ["Red", "Dark"])
+    scorer = scores_from({"Colour": 1, "Red": 1})
+
+    with_scorer = build_table(rows, None, LIMITS, scorer)
+
+    assert with_scorer == build_table(rows, None, LIMITS)
+    assert with_scorer.header_row == 2
+
+
+def test_fallback_without_a_header_like_row_fails_as_before() -> None:
+    rows = numbered(*([["1", "2"]] * 3), ["Part", "Qty"])
+
+    with pytest.raises(ParseError) as exc:
+        build_table(rows, None, ParseLimits(header_scan_rows=3), scores_from({}))
+
+    assert exc.value.code is ParseErrorCode.NO_HEADER
+
+
+def test_the_highest_score_wins_over_an_earlier_header_like_row() -> None:
+    rows = numbered(["Part", "Qty"], ["Item", "Count", "Name"], ["A", "1", "x"])
+
+    table = build_table(rows, None, LIMITS, scores_from({"Part": 2, "Item": 3}))
+
+    assert table.header_row == 2
+
+
+def test_equal_scores_go_to_the_row_with_more_text_cells() -> None:
+    rows = numbered(["Part", "Qty", "1"], ["Item", "Count", "Name"], ["A", "1", "x"])
+
+    table = build_table(rows, None, LIMITS, scores_from({"Part": 2, "Item": 2}))
+
+    assert table.header_row == 2
+
+
+def test_equal_scores_and_text_cells_go_to_the_earlier_row() -> None:
+    rows = numbered(["Part", "Qty"], ["Item", "Count"], ["A", "1"])
+
+    table = build_table(rows, None, LIMITS, scores_from({"Part": 2, "Item": 2}))
+
+    assert table.header_row == 1
+    assert [(r.row_number, r.cells) for r in table.sample_rows] == [
+        (2, ["Item", "Count"]),
+        (3, ["A", "1"]),
+    ]
+
+
+def test_explicit_header_row_wins_over_the_scorer() -> None:
+    table = build_table(fan_rows(), 3, LIMITS, count_standard_field_matches)
+
+    assert table.header_row == 3
+
+
+def test_only_rows_within_the_score_window_are_scored() -> None:
+    rows = numbered(["Part", "Qty"], ["A", "1"], ["Item", "Count"])
+    scorer = scores_from({"Part": 2, "Item": 5})
+    limits = ParseLimits(header_scan_rows=1, header_score_scan_rows=2)
+
+    table = build_table(rows, None, limits, scorer)
+
+    assert table.header_row == 1
+    assert table.row_count == 2
+
+
+def test_scanned_rows_below_the_scored_header_keep_their_empty_rows_counted() -> None:
+    rows = numbered(["Note"], [], ["Part", "Qty"], [], ["A", "1"], [], [])
+
+    table = build_table(rows, None, LIMITS, scores_from({"Part": 2}))
+
+    assert table.header_row == 3
+    assert table.row_count == 1
+    assert table.skipped_empty_rows == 3
+
+
+def test_scored_detection_of_only_empty_rows_is_an_empty_file() -> None:
+    with pytest.raises(ParseError) as exc:
+        build_table(numbered([], [""]), None, LIMITS, scores_from({}))
+
+    assert exc.value.code is ParseErrorCode.EMPTY_FILE
+
+
+def test_scored_detection_keeps_the_leading_empty_row_limit() -> None:
+    rows = numbered(*([[]] * 4), ["Part", "Qty"])
+
+    with pytest.raises(ParseError) as exc:
+        build_table(rows, None, ParseLimits(max_leading_empty_rows=3), scores_from({"Part": 2}))
+
+    assert exc.value.code is ParseErrorCode.FILE_TOO_COMPLEX
+
+
+def test_scored_header_wider_than_the_column_limit_fails() -> None:
+    rows = numbered(["Part", "Qty", "Cost"], ["A", "1", "2"])
+
+    with pytest.raises(ParseError) as exc:
+        build_table(rows, None, ParseLimits(max_columns=2), scores_from({"Part": 2}))
+
+    assert exc.value.code is ParseErrorCode.TOO_MANY_COLUMNS

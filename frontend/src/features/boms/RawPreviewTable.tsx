@@ -39,6 +39,7 @@ export function RawPreviewTable({ preview }: RawPreviewTableProps) {
     preview.suggested_mapping.map((suggestion) => [suggestion.source_column_index, suggestion]),
   );
   const missing = preview.missing_required.map((key) => fieldLabel(preview.target_fields, key));
+  const formulaCellsWithoutValue = preview.formula_cells_without_value ?? 0;
 
   return (
     <div className="space-y-4">
@@ -49,6 +50,18 @@ export function RawPreviewTable({ preview }: RawPreviewTableProps) {
             <p>
               No column was matched to: {missing.join(', ')}. Check the header row, or rename the
               columns and upload the file again.
+            </p>
+          </AlertDescription>
+        </Alert>
+      )}
+      {formulaCellsWithoutValue > 0 && (
+        <Alert variant="warning">
+          <AlertTitle>Formulas without saved values</AlertTitle>
+          <AlertDescription>
+            <p>
+              {plural(formulaCellsWithoutValue, 'formula cell has', 'formula cells have')} no saved
+              value, so {formulaCellsWithoutValue === 1 ? 'it appears' : 'they appear'} empty. Open
+              the file in Excel, save it, and upload it again.
             </p>
           </AlertDescription>
         </Alert>

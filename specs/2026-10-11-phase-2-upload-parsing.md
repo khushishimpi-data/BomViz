@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-11
 - **Author:** Khushi Shimpi
-- **Status:** Done — awaiting user review (2026-10-11)
+- **Status:** Done — awaiting user review (2026-10-12)
 - **ClickUp task:** n/a
 
 ## Context
@@ -397,6 +397,36 @@ proactive token refresh before large uploads (nit 9), redundant `ix_bom_uploads_
 - **Do:** ARCHITECTURE/API reflect G1–G3 and the S3 fix (intake order, worker ownership/fencing,
   time limits, retries, XLSX/CSV guards).
 
+## Follow-up from user testing (2026-10-12)
+
+A real manufacturing export (`Manufacturing_BOM_Electric_Table_Fan.xlsx`) exposed three gaps: a
+key/value information block above the table was taken as the header (rows 3–4 instead of 10);
+"Component / Material" and "Qty per Finished Unit" were not suggested as Part name and Quantity;
+formula columns never saved by Excel appeared silently empty. Approved by the user.
+
+### [x] H1 — Header detection by standard-field matches
+- **Skills:** input-validation, testing-standard
+- **Do:** among the first 30 non-empty rows, score each row by how many distinct standard fields
+  its cells match (using the mapping-suggestion scorer, threshold 0.8); pick the highest score
+  ≥ 2; ties → more non-empty text cells, then the earlier row. If no row scores ≥ 2, fall back to
+  the existing heuristic. The parser stays DB-free: the scorer is injected
+  (`ParseOptions`-independent `header_scorer` argument to `parse_file`, supplied by the parse job).
+
+### [x] H2 — More column-name variants
+- **Skills:** testing-standard
+- **Do:** Part name: "component", "component name", "component / material", "component
+  description"; Quantity: "qty per finished unit", "qty per unit", "quantity per unit", "qty per
+  assembly", "qty per parent", "usage per unit". Keep the no-collision rule; "Material" alone stays
+  Material, "Effective Qty per Unit" / "Batch Qty Required" stay unmapped.
+
+### [x] H3 — Warn about formula cells without saved values
+- **Skills:** input-validation, component-standards, ui-testing
+- **Do:** XLSX: count cells in the chosen sheet that have a formula (`<f>`) but no saved value
+  (`<v>` missing or empty) by streaming the sheet XML with defusedxml (bounded by the existing zip
+  limits); expose `formula_cells_without_value: int` in the parse snapshot and `PreviewResponse`
+  (0 for CSV/XLS). Frontend: when > 0, the preview shows a warning: "N formula cells have no
+  saved value, so they appear empty. Open the file in Excel, save it, and upload it again."
+
 ## Review & delivery
 
 - [x] Full-diff review by code-reviewer — 1 Blocker + 7 Should-fix resolved (G1–G4, S3 preview fix)
@@ -417,6 +447,8 @@ proactive token refresh before large uploads (nit 9), redundant `ix_bom_uploads_
 - Parser: CSV `header_row`/`row_number` are physical line numbers; delimiter falls back to a per-line consistency heuristic; column names capped at 255; mapping suggestions never cascade to a column's second-best target.
 - UTF-16 CSVs (with BOM, decodable) are allowed despite the NUL-byte rule.
 - Frontend: the preview query is keyed by the parse job that produced it (S3, also caught by the Playwright journey).
+
+**Follow-up H1–H3 (2026-10-12), verified on the user's real file:** header detection by standard-field matches (row 10 found on `Manufacturing_BOM_Electric_Table_Fan.xlsx`), "Component / Material" and "Qty per Finished Unit" recognised, and a warning for XLSX formula cells without saved values (58 on that file). A column named just "Component" now maps to Part name (it was a Part number synonym). Not done: flagging summary rows such as "TOTAL MATERIAL COST" (left to Phase 3 validation).
 
 **Known limitations:** XLSX data beyond column `PARSE_MAX_COLUMNS + 1` is not read when that column is empty; a hard-killed parse may stay `RUNNING` until the 15-minute stale rule; cancellation during the storage PUT itself is not cleaned up.
 

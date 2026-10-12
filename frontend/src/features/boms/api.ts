@@ -116,6 +116,11 @@ export interface BomPreview {
   readonly row_count: number;
   readonly column_count: number;
   readonly skipped_empty_rows: number;
+  /**
+   * XLSX cells holding a formula but no saved result, so they read as empty. Always sent by the
+   * API (0 for CSV/XLS); optional so an older response is treated as 0.
+   */
+  readonly formula_cells_without_value?: number;
   readonly rows: readonly PreviewRow[];
   readonly suggested_mapping: readonly SuggestedMapping[];
   readonly missing_required: readonly string[];

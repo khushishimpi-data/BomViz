@@ -10,7 +10,15 @@ import pytest
 from openpyxl import Workbook
 from openpyxl.utils.datetime import CALENDAR_MAC_1904
 
-from app.services.parsing import ParseError, ParseErrorCode, ParseLimits, ParseOptions, parse_file
+from app.services.mapping_suggestions import count_standard_field_matches, suggest_mapping
+from app.services.parsing import (
+    ParseError,
+    ParseErrorCode,
+    ParseLimits,
+    ParseOptions,
+    ParseOutcome,
+    parse_file,
+)
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "boms"
 SHEET1 = "xl/worksheets/sheet1.xml"
@@ -335,3 +343,149 @@ def test_members_that_together_compress_too_well_are_rejected(tmp_path: Path) ->
             archive.writestr(f"xl/worksheets/sheet{index + 1}.xml", bytes(900 * 1024))
 
     expect_error(path, ParseErrorCode.FILE_TOO_COMPLEX)
+
+
+# --- manufacturing export: information block and never-calculated formulas ------------------
+
+FAN_HEADER = [
+    "Level",
+    "Item Code",
+    "Component / Material",
+    "Specification / Notes",
+    "UOM",
+    "Qty per Finished Unit",
+    "Scrap %",
+    "Effective Qty per Unit",
+    "Batch Qty Required",
+    "Unit Cost (₹)",
+    "Extended Cost per Unit (₹)",
+    "Batch Cost (₹)",
+]
+FAN_DATA_ROWS = range(11, 25)
+
+
+def fan_workbook() -> Workbook:
+    """The shape of a manufacturing BOM export whose formulas were never calculated."""
+    workbook = Workbook()
+    sheet = workbook.active
+    assert sheet is not None
+    sheet.title = "Manufacturing BOM"
+    sheet["A1"] = "MANUFACTURING BILL OF MATERIALS"
+    info: list[tuple[str, str | float]] = [
+        ("Product", "Electric Table Fan — 400 mm"),
+        ("Finished Good Code", "FG-FAN-400"),
+        ("BOM Revision", "A"),
+        ("BOM Type", "Manufacturing BOM"),
+        ("Production Batch Size (units)", 100),
+        ("Currency", "INR (₹)"),
+    ]
+    for row, (key, value) in enumerate(info, start=3):
+        sheet.cell(row=row, column=1, value=key)
+        sheet.cell(row=row, column=2, value=value)
+    for column, name in enumerate(FAN_HEADER, start=1):
+        sheet.cell(row=10, column=column, value=name)
+    for row in FAN_DATA_ROWS:
+        values: list[str | float] = [
+            1,
+            f"RM-{row - 10:03d}",
+            f"Part {row}",
+            "Steel",
+            "Nos",
+            1,
+            0.02,
+        ]
+        formulas: list[str | float] = [
+            f"=F{row}*(1+G{row})",
+            f"=H{row}*$B$7",
+            85,
+            f"=H{row}*J{row}",
+        ]
+        for column, value in enumerate([*values, *formulas, f"=I{row}*J{row}"], start=1):
+            sheet.cell(row=row, column=column, value=value)
+    sheet["C25"] = "TOTAL MATERIAL COST"
+    return workbook
+
+
+def parse_fan(path: Path) -> ParseOutcome:
+    return parse_file(path, "XLSX", header_scorer=count_standard_field_matches)
+
+
+def test_fan_export_detects_the_table_header_below_the_information_block(tmp_path: Path) -> None:
+    outcome = parse_fan(save(fan_workbook(), tmp_path))
+
+    assert outcome.effective_options == ParseOptions(sheet_name="Manufacturing BOM", header_row=10)
+    assert [c.name for c in outcome.columns] == FAN_HEADER
+    assert outcome.row_count == len(FAN_DATA_ROWS) + 1  # the TOTAL row is data in the raw stage
+
+
+def test_fan_export_suggests_every_required_field(tmp_path: Path) -> None:
+    outcome = parse_fan(save(fan_workbook(), tmp_path))
+
+    mapping = suggest_mapping(outcome.columns)
+    targets = {c.source_column_name: c.target_field for c in mapping.columns}
+    assert targets["Level"] == "bom_level"
+    assert targets["Item Code"] == "part_number"
+    assert targets["Component / Material"] == "part_name"
+    assert targets["UOM"] == "unit_of_measure"
+    assert targets["Qty per Finished Unit"] == "quantity"
+    assert targets["Unit Cost (₹)"] == "unit_cost"
+    assert mapping.missing_required == []
+
+
+def test_fan_export_counts_formula_cells_without_saved_values(tmp_path: Path) -> None:
+    outcome = parse_fan(save(fan_workbook(), tmp_path))
+
+    assert outcome.formula_cells_without_value == 4 * len(FAN_DATA_ROWS)
+
+
+def test_formula_cells_with_cached_values_are_not_counted(tmp_path: Path) -> None:
+    path = save(fan_workbook(), tmp_path)
+    rewrite_member(path, SHEET1, lambda xml: xml.replace("<v />", "<v>1</v>"))
+
+    outcome = parse_fan(path)
+
+    assert outcome.formula_cells_without_value == 0
+    assert outcome.sample_rows[0].cells[7] == "1"
+
+
+def test_formula_cells_without_a_value_element_are_counted(tmp_path: Path) -> None:
+    path = save(fan_workbook(), tmp_path)
+    rewrite_member(path, SHEET1, lambda xml: xml.replace("<v />", ""))
+
+    assert parse_fan(path).formula_cells_without_value == 4 * len(FAN_DATA_ROWS)
+
+
+def test_formula_cells_above_the_header_row_are_not_counted(tmp_path: Path) -> None:
+    workbook = bom_workbook()
+    sheet = workbook.active
+    assert sheet is not None
+    sheet["B1"] = "=1+1"  # in the title row, above the header on row 3
+    sheet["C4"] = "=B4*2"
+
+    outcome = parse_file(save(workbook, tmp_path), "XLSX")
+
+    assert outcome.effective_options.header_row == 3
+    assert outcome.formula_cells_without_value == 1
+
+
+def test_formula_count_follows_the_explicit_header_row(tmp_path: Path) -> None:
+    path = save(fan_workbook(), tmp_path)
+
+    outcome = parse_file(path, "XLSX", ParseOptions(header_row=20))
+
+    assert outcome.formula_cells_without_value == 4 * len(range(20, 25))
+
+
+def test_formula_count_reads_only_the_chosen_sheet(tmp_path: Path) -> None:
+    workbook = fan_workbook()
+    other = workbook.create_sheet("Plain")
+    other.append(["Part Number", "Qty"])
+    other.append(["P-1", 2])
+
+    outcome = parse_file(save(workbook, tmp_path), "XLSX", ParseOptions(sheet_name="Plain"))
+
+    assert outcome.formula_cells_without_value == 0
+
+
+def test_workbook_without_formulas_counts_zero(tmp_path: Path) -> None:
+    assert parse_file(save(bom_workbook(), tmp_path), "XLSX").formula_cells_without_value == 0

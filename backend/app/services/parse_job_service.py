@@ -62,7 +62,7 @@ from app.repositories.bom_repository import BomAccess
 from app.services.audit_service import AuditAction, AuditService
 from app.services.job_enqueue import enqueue_parse_job, new_task_id
 from app.services.job_queue import JobQueue
-from app.services.mapping_suggestions import suggest_mapping
+from app.services.mapping_suggestions import count_standard_field_matches, suggest_mapping
 from app.services.parsing import (
     ParseError,
     ParseErrorCode,
@@ -173,6 +173,7 @@ def _snapshot(outcome: ParseOutcome) -> _ParseSnapshot:
             "row_count": outcome.row_count,
             "column_count": outcome.column_count,
             "skipped_empty_rows": outcome.skipped_empty_rows,
+            "formula_cells_without_value": outcome.formula_cells_without_value,
             "rows": [dataclasses.asdict(row) for row in outcome.sample_rows],
             "suggested_mapping": [dataclasses.asdict(column) for column in mapping.columns],
             "missing_required": list(mapping.missing_required),
@@ -382,7 +383,13 @@ async def _download_and_parse(
     with tempfile.TemporaryDirectory(prefix="bomviz-parse-", ignore_cleanup_errors=True) as tmp:
         path = Path(tmp) / f"original.{FILE_EXTENSIONS[bom.file_format]}"
         await storage.download_to(bom.original_file_key, path)
-        return parse_file(path, bom.file_format.value, options, limits)
+        return parse_file(
+            path,
+            bom.file_format.value,
+            options,
+            limits,
+            header_scorer=count_standard_field_matches,
+        )
 
 
 async def run_parse_job(

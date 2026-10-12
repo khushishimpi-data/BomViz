@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 import xlrd
 
+from app.services.mapping_suggestions import count_standard_field_matches
 from app.services.parsing import ParseError, ParseErrorCode, ParseLimits, ParseOptions, parse_file
 
 FIXTURES = Path(__file__).resolve().parents[2] / "fixtures" / "boms"
@@ -104,3 +105,10 @@ def test_value_beyond_the_column_limit_fails() -> None:
         parse_file(FIXTURES / "basic.xls", "XLS", limits=ParseLimits(max_columns=5))
 
     assert exc.value.code is ParseErrorCode.TOO_MANY_COLUMNS
+
+
+def test_header_scorer_is_applied_and_no_formula_cells_are_reported() -> None:
+    outcome = parse_file(FIXTURES / "basic.xls", "XLS", header_scorer=count_standard_field_matches)
+
+    assert outcome.effective_options == ParseOptions(sheet_name="BOM", header_row=3)
+    assert outcome.formula_cells_without_value == 0

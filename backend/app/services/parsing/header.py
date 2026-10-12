@@ -32,6 +32,10 @@ EXCEL_MAX_ROWS = 1_048_576
 
 Row = tuple[int, Sequence[str]]
 RowSource = Generator[Row, None, None]
+# Scores a candidate header row: how many distinct standard fields its cells name.
+HeaderScorer = Callable[[Sequence[str]], int]
+# A row must name at least this many standard fields to be chosen by its score.
+MIN_HEADER_SCORE = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +81,8 @@ class WorkbookTable:
     sheets: list[SheetInfo]
     sheet_name: str
     table: TableShape
+    # Formula cells from the header row down without a cached value (XLSX only).
+    formula_cells_without_value: int = 0
 
 
 def select_sheet(
@@ -117,14 +123,24 @@ def _first_non_empty_row(rows: Iterator[Row], limits: ParseLimits) -> Row | None
     return None
 
 
-def build_table(rows: Iterable[Row], header_row: int | None, limits: ParseLimits) -> TableShape:
+def build_table(
+    rows: Iterable[Row],
+    header_row: int | None,
+    limits: ParseLimits,
+    header_scorer: HeaderScorer | None = None,
+) -> TableShape:
     """Locate the header, then count and sample the data rows below it.
 
     `header_row` is the explicit 1-based source row of the header; `None` auto-detects it.
+    With a `header_scorer`, detection first looks for the row that names the most standard
+    fields (see `_find_scored_header`), and falls back to the text heuristic.
     Raises `ParseError` for an empty source, a missing header or an exceeded limit.
     """
-    stream = iter(rows)
-    header_number, header_cells = _find_header(stream, header_row, limits)
+    stream: Iterator[Row] = iter(rows)
+    if header_row is None and header_scorer is not None:
+        header_number, header_cells, stream = _find_scored_header(stream, header_scorer, limits)
+    else:
+        header_number, header_cells = _find_header(stream, header_row, limits)
     header_width = _trimmed_width(header_cells)
 
     row_count = 0
@@ -200,6 +216,87 @@ def looks_like_header(cells: Sequence[str]) -> bool:
     return textual * 2 >= len(filled)
 
 
+@dataclass(frozen=True, slots=True)
+class _ScannedRow:
+    row: Row
+    empty_rows_before: int
+
+
+def _find_scored_header(
+    stream: Iterator[Row], scorer: HeaderScorer, limits: ParseLimits
+) -> tuple[int, Sequence[str], Iterator[Row]]:
+    """The row naming the most standard fields among the first non-empty rows.
+
+    Scans `header_score_scan_rows` non-empty rows (at least `header_scan_rows`, so the fallback
+    sees the same window as the plain heuristic). The highest score of at least
+    `MIN_HEADER_SCORE` wins; ties go to the row with more text cells, then the earlier row.
+    Without such a row the first row that `looks_like_header` is used, as without a scorer.
+    Returns the header and the rows below it: the scanned rest, then the unread stream.
+    """
+    window = max(limits.header_score_scan_rows, limits.header_scan_rows)
+    scanned: list[_ScannedRow] = []
+    consecutive_empty = 0
+    for row in stream:
+        cells = row[1]
+        _check_cell_lengths(cells, limits)
+        if not _trimmed_width(cells):
+            consecutive_empty += 1
+            _check_leading_empty_rows(consecutive_empty, limits)
+            continue
+        scanned.append(_ScannedRow(row, consecutive_empty))
+        consecutive_empty = 0
+        if len(scanned) >= window:
+            break
+    if not scanned:
+        raise ParseError(ParseErrorCode.EMPTY_FILE, "The file contains no data.")
+    trailing_empty = consecutive_empty
+
+    best: tuple[int, int, int] | None = None  # (score, text cells, -position)
+    for position, entry in enumerate(scanned):
+        score = scorer(entry.row[1])
+        if score >= MIN_HEADER_SCORE:
+            key = (score, _text_cell_count(entry.row[1]), -position)
+            if best is None or key > best:
+                best = key
+    if best is not None:
+        chosen = -best[2]
+    else:
+        fallback = scanned[: limits.header_scan_rows]
+        chosen = next(
+            (i for i, entry in enumerate(fallback) if looks_like_header(entry.row[1])), -1
+        )
+        if chosen < 0:
+            raise _no_header_in_window(limits)
+
+    header_number, header_cells = scanned[chosen].row
+    _check_column_count(_trimmed_width(header_cells), limits)
+    rest = _replay(scanned[chosen + 1 :], trailing_empty)
+    return header_number, header_cells, itertools.chain(rest, stream)
+
+
+def _replay(scanned: Sequence[_ScannedRow], trailing_empty: int) -> Iterator[Row]:
+    """The scanned rows again, with their empty rows as cheap empty sequences."""
+    for entry in scanned:
+        for _ in range(entry.empty_rows_before):
+            yield 0, ()
+        yield entry.row
+    for _ in range(trailing_empty):
+        yield 0, ()
+
+
+def _text_cell_count(cells: Sequence[str]) -> int:
+    """Non-empty cells that are not numbers."""
+    return sum(1 for cell in cells if cell.strip() and not _NUMBER_RE.fullmatch(cell.strip()))
+
+
+def _no_header_in_window(limits: ParseLimits) -> ParseError:
+    return ParseError(
+        ParseErrorCode.NO_HEADER,
+        f"No header row was found in the first {limits.header_scan_rows} non-empty rows. "
+        "Choose the header row explicitly.",
+    )
+
+
 def _find_header(
     stream: Iterator[Row], header_row: int | None, limits: ParseLimits
 ) -> tuple[int, Sequence[str]]:
@@ -235,11 +332,7 @@ def _find_header(
                 ParseErrorCode.NO_HEADER,
                 f"Header row {header_row} is beyond the end of the data.",
             )
-    raise ParseError(
-        ParseErrorCode.NO_HEADER,
-        f"No header row was found in the first {limits.header_scan_rows} non-empty rows. "
-        "Choose the header row explicitly.",
-    )
+    raise _no_header_in_window(limits)
 
 
 def _check_explicit_header(row_number: int, width: int, header_row: int) -> None:

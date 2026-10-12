@@ -71,18 +71,32 @@ _FIELD_TERMS: tuple[_FieldTerms, ...] = tuple(_field_terms(field) for field in S
 
 
 def _score(header: str, terms: _FieldTerms) -> float:
+    """The pair's score when it reaches `FUZZY_THRESHOLD`; below it, some value below it.
+
+    The cheap upper bounds of `SequenceMatcher` skip terms that cannot reach the threshold, so
+    long cells (up to the 32,767-character cell limit) cost little.
+    """
     if header.replace(" ", "") in terms.compact_terms:
         return 1.0
-    return max(SequenceMatcher(None, header, term).ratio() for term in terms.terms)
+    best = 0.0
+    for term in terms.terms:
+        matcher = SequenceMatcher(None, header, term)
+        if matcher.real_quick_ratio() < FUZZY_THRESHOLD or matcher.quick_ratio() < FUZZY_THRESHOLD:
+            continue
+        best = max(best, matcher.ratio())
+    return best
 
 
-def suggest_mapping(columns: Sequence[ColumnInfo]) -> MappingSuggestion:
-    """Map each column to at most one standard field, and each field to at most one column."""
-    # Each column competes only for its own best target (ties: field order); there is no
-    # fallback to a second-best target when a higher-ranked column has already taken it.
-    candidates: list[tuple[float, int, int]] = []  # (score, column position, field position)
-    for column_position, column in enumerate(columns):
-        header = normalize_header(column.name)
+def _assign(names: Sequence[str], order: Sequence[int]) -> dict[int, tuple[int, float]]:
+    """Position of each assigned name -> (field position, score).
+
+    `order` breaks equal scores (lower first). Each name competes only for its own best target
+    (ties: field order); there is no fallback to a second-best target when a higher-ranked name
+    has already taken it.
+    """
+    candidates: list[tuple[float, int, int]] = []  # (score, name position, field position)
+    for position, name in enumerate(names):
+        header = normalize_header(name)
         if not header:
             continue
         best_score, best_field = max(
@@ -90,16 +104,33 @@ def suggest_mapping(columns: Sequence[ColumnInfo]) -> MappingSuggestion:
             for field_position, terms in enumerate(_FIELD_TERMS)
         )
         if best_score >= FUZZY_THRESHOLD:
-            candidates.append((best_score, column_position, -best_field))
+            candidates.append((best_score, position, -best_field))
 
-    candidates.sort(key=lambda c: (-c[0], columns[c[1]].index, c[2]))
-    assigned: dict[int, tuple[int, float]] = {}  # column position -> (field position, score)
+    candidates.sort(key=lambda c: (-c[0], order[c[1]], c[2]))
+    assigned: dict[int, tuple[int, float]] = {}
     used_fields: set[int] = set()
-    for score, column_position, field_position in candidates:
-        if column_position in assigned or field_position in used_fields:
+    for score, position, field_position in candidates:
+        if position in assigned or field_position in used_fields:
             continue
-        assigned[column_position] = (field_position, score)
+        assigned[position] = (field_position, score)
         used_fields.add(field_position)
+    return assigned
+
+
+def count_standard_field_matches(cells: Sequence[str]) -> int:
+    """How many distinct standard fields the cells of one row would be suggested for.
+
+    The same scoring and assignment as `suggest_mapping` (threshold `FUZZY_THRESHOLD`, each
+    cell and each field used at most once), so a row's count is the number of columns it would
+    map if it were the header. Used to recognise the header row.
+    """
+    return len(_assign(cells, range(len(cells))))
+
+
+def suggest_mapping(columns: Sequence[ColumnInfo]) -> MappingSuggestion:
+    """Map each column to at most one standard field, and each field to at most one column."""
+    assigned = _assign([column.name for column in columns], [column.index for column in columns])
+    used_fields = {field_position for field_position, _ in assigned.values()}
 
     suggestions: list[ColumnSuggestion] = []
     for column_position, column in enumerate(columns):

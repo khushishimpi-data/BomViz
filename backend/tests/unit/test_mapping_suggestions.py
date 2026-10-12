@@ -7,6 +7,7 @@ from app.domain.bom_fields import STANDARD_FIELDS
 from app.services.mapping_suggestions import (
     ColumnSuggestion,
     MappingSuggestion,
+    count_standard_field_matches,
     normalize_header,
     suggest_mapping,
 )
@@ -233,3 +234,97 @@ def test_no_columns_reports_every_required_field_missing() -> None:
     assert result == MappingSuggestion(
         columns=[], missing_required=["part_number", "part_name", "quantity"]
     )
+
+
+# --- manufacturing-export variants -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("header", "field"),
+    [
+        ("Component", "part_name"),
+        ("Component Name", "part_name"),
+        ("Component / Material", "part_name"),
+        ("Component Description", "part_name"),
+        ("Qty per Finished Unit", "quantity"),
+        ("Qty per Unit", "quantity"),
+        ("Quantity per Unit", "quantity"),
+        ("Qty per Assembly", "quantity"),
+        ("Qty per Parent", "quantity"),
+        ("Usage per Unit", "quantity"),
+        ("Material", "material"),
+    ],
+)
+def test_manufacturing_variants_map_exactly(header: str, field: str) -> None:
+    assert _suggest(header).columns == [ColumnSuggestion(0, header, field, 1.0)]
+
+
+def test_manufacturing_header_maps_each_required_field_once() -> None:
+    result = _suggest(
+        "Level",
+        "Item Code",
+        "Component / Material",
+        "Specification / Notes",
+        "UOM",
+        "Qty per Finished Unit",
+        "Scrap %",
+        "Effective Qty per Unit",
+        "Batch Qty Required",
+        "Unit Cost (₹)",
+    )
+
+    assert [c.target_field for c in result.columns] == [
+        "bom_level",
+        "part_number",
+        "part_name",
+        None,
+        "unit_of_measure",
+        "quantity",
+        None,
+        None,
+        None,
+        "unit_cost",
+    ]
+    assert result.missing_required == []
+
+
+@pytest.mark.parametrize("header", ["Effective Qty per Unit", "Batch Qty Required"])
+def test_derived_quantity_columns_stay_unmapped_on_their_own(header: str) -> None:
+    # Fuzzy ratios against "qty per unit" etc. stay below the threshold, so a column that is a
+    # computed quantity is never offered as the quantity per parent.
+    assert _targets(header) == [None]
+
+
+# --- count_standard_field_matches ------------------------------------------------------------
+
+
+def test_counts_distinct_fields_named_by_a_row() -> None:
+    assert count_standard_field_matches(["Level", "Item Code", "Component", "Qty", "Colour"]) == 4
+
+
+def test_cells_naming_the_same_field_count_once() -> None:
+    assert count_standard_field_matches(["Notes", "Remarks", "Comment"]) == 1
+
+
+def test_fuzzy_matches_count_only_at_the_threshold() -> None:
+    # "Qtys" is a fuzzy quantity match; "Colour" matches nothing.
+    assert count_standard_field_matches(["Qtys", "Colour"]) == 1
+
+
+def test_data_and_blank_cells_count_nothing() -> None:
+    assert count_standard_field_matches(["RM-001", "Front grill", "", "1", "0.02"]) == 0
+
+
+def test_an_empty_row_counts_zero() -> None:
+    assert count_standard_field_matches([]) == 0
+
+
+def test_a_cell_at_the_length_limit_counts_nothing() -> None:
+    assert count_standard_field_matches(["Qty " * 8191, "x" * 32_767]) == 0
+
+
+def test_count_agrees_with_the_suggested_mapping() -> None:
+    names = ("Part #", "Part No", "Qty", "Qtys", "Vendor", "Vendor Name", "Notes")
+
+    mapped = [c for c in _suggest(*names).columns if c.target_field is not None]
+    assert count_standard_field_matches(names) == len(mapped)

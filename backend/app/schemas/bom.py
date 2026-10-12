@@ -130,6 +130,9 @@ class PreviewResponse(BaseModel):
     row_count: int
     column_count: int
     skipped_empty_rows: int
+    # Formula cells without a saved value (they read as empty); 0 for snapshots taken before
+    # the count existed.
+    formula_cells_without_value: int = 0
     rows: list[PreviewRowResponse]
     suggested_mapping: list[ColumnSuggestionResponse]
     missing_required: list[str]

@@ -1887,6 +1887,7 @@ async def test_the_preview_returns_the_parse_snapshot_and_target_fields(env: Env
     assert body["row_count"] == 1
     assert body["column_count"] == 3
     assert body["skipped_empty_rows"] == 0
+    assert body["formula_cells_without_value"] == 0
     assert body["rows"] == [{"row_number": 2, "cells": ["P-1", "Bolt", "4"]}]
     assert [item["target_field"] for item in body["suggested_mapping"]] == [
         "part_number",
@@ -1900,6 +1901,55 @@ async def test_the_preview_returns_the_parse_snapshot_and_target_fields(env: Env
         "required": True,
     }
     assert {"key": "notes", "label": "Notes", "required": False} in body["target_fields"]
+
+
+async def test_the_preview_reports_formula_cells_without_saved_values(
+    env: Env, tmp_path: Path
+) -> None:
+    setup = await _setup(env.client)
+    workbook = Workbook()
+    sheet = workbook.active
+    assert sheet is not None
+    sheet.append(["Part Number", "Part Name", "Qty", "Unit Cost", "Total Cost"])
+    sheet.append(["P-1", "Bolt", 4, 2, "=C2*D2"])
+    path = tmp_path / "formulas.xlsx"
+    workbook.save(path)
+    bom = await _uploaded(
+        env.client,
+        setup.admin,
+        setup.workspace_id,
+        content=path.read_bytes(),
+        filename="formulas.xlsx",
+    )
+    await _run_latest_job(env, bom)
+
+    response = await env.client.get(_preview_url(bom["id"]), headers=setup.admin.headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["formula_cells_without_value"] == 1
+    assert response.json()["rows"][0]["cells"][4] == ""
+
+
+async def test_a_snapshot_without_the_formula_count_previews_it_as_zero(
+    env: Env, db_session: AsyncSession
+) -> None:
+    setup = await _setup(env.client)
+    bom = await _uploaded(env.client, setup.admin, setup.workspace_id)
+    await _run_latest_job(env, bom)
+    row = await db_session.get(BomUpload, uuid.UUID(bom["id"]))
+    assert row is not None and row.parse_result is not None
+    old_snapshot = {k: v for k, v in row.parse_result.items() if k != "formula_cells_without_value"}
+    await db_session.execute(
+        update(BomUpload)
+        .where(BomUpload.id == uuid.UUID(bom["id"]))
+        .values(parse_result=old_snapshot)
+    )
+    await db_session.commit()
+
+    response = await env.client.get(_preview_url(bom["id"]), headers=setup.admin.headers)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["formula_cells_without_value"] == 0
 
 
 async def test_the_preview_accepts_an_explicit_raw_stage(env: Env) -> None:

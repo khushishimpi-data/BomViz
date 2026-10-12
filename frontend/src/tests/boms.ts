@@ -96,6 +96,7 @@ export function buildPreview(overrides: Partial<BomPreview> = {}): BomPreview {
     row_count: 42,
     column_count: 3,
     skipped_empty_rows: 2,
+    formula_cells_without_value: 0,
     rows: [
       { row_number: 4, cells: ['P-100', '2', 'RED'] },
       { row_number: 5, cells: ['P-200', '1', '<b>BLUE</b>'] },
